@@ -289,6 +289,12 @@ nomad action -job tailscale-connector -group connector -task connector dry-run
   connector recovers on its own within a minute. (Occasional stream EOFs
   with successful reconnects are harmless; a tight loop that never settles
   is the ACL signature.)
+- **`service ... has no address/port; not published`** — the Nomad service
+  registration itself carries no address (check `nomad service info <name>`):
+  the `service` block is missing `port = "<label>"`, or the group `network`
+  block doesn't define that port label (for Docker tasks, also publish it
+  via `ports = [...]` in the task config). The connector can only proxy to
+  what Nomad registers.
 - **`service hosts must be tagged nodes`** — the connector's device is
   untagged: use a tagged auth key (or set `-ts-tags` with a tag the key may
   advertise).
