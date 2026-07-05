@@ -11,10 +11,10 @@
 
 # The connector release to install, e.g.:
 #
-#   nomad job run -var version=0.1.1 tailscale-connector.nomad.hcl
+#   nomad job run -var version=1.0.0 tailscale-connector.nomad.hcl
 variable "version" {
   type        = string
-  default     = "0.1.0"
+  default     = "1.0.0"
   description = "Connector release to install (GitHub release tag v<version>)."
 }
 

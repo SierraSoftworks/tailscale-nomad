@@ -172,7 +172,7 @@ identity — no API address or token configuration needed. The release version
 is a job variable, so upgrades are a re-run away:
 
 ```sh
-nomad job run -var version=0.1.1 jobs/tailscale-connector.nomad.hcl
+nomad job run -var version=1.0.0 jobs/tailscale-connector.nomad.hcl
 ```
 
 Each node appears in your tailnet as `nomad-<node-name>`. On nodes without
