@@ -63,15 +63,19 @@ across the available hosts, failing over when one drains.
   Services; it does not create Service definitions.
 - A **tagged auth key** (Service hosts must be tagged devices; the connector
   refuses to publish from an untagged node). Create one under
-  **Settings → Keys** — reusable, pre-authorized, with a tag such as
-  `tag:nomad` — or use an OAuth client via `TS_CLIENT_SECRET`.
+  **Settings → Keys** — reusable, pre-authorized, with a dedicated tag such
+  as `tag:nomad-tailscale` — or use an OAuth client via `TS_CLIENT_SECRET`.
+  Prefer a dedicated tag over reusing one that carries network access (e.g.
+  a `tag:nomad` used for cluster peering): the connector's tag exists only
+  to satisfy the tagged-device requirement and to key `autoApprovers`
+  rules, so it shouldn't inherit any ACL grants it doesn't need.
 - Ideally an `autoApprovers` rule in your tailnet policy so advertisements
   don't sit waiting for manual approval:
 
   ```jsonc
   "autoApprovers": {
     "services": {
-      "svc:whoami": ["tag:nomad"],
+      "svc:whoami": ["tag:nomad-tailscale"],
     },
   },
   ```
