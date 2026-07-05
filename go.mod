@@ -2,7 +2,10 @@ module github.com/SierraSoftworks/tailscale-nomad
 
 go 1.26.4
 
-require tailscale.com v1.100.0
+require (
+	github.com/sierrasoftworks/humane-errors-go v0.0.0-20260619132337-5754e417d028
+	tailscale.com v1.100.0
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -34,6 +37,8 @@ require (
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
 	github.com/tailscale/wireguard-go v0.0.0-20260527010701-b48af7099cad // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.uber.org/zap v1.28.0 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/crypto v0.52.0 // indirect

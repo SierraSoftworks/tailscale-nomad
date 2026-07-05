@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	humane "github.com/sierrasoftworks/humane-errors-go"
 )
 
 // nomadClient is a minimal client for the handful of Nomad HTTP API endpoints
@@ -23,6 +26,7 @@ import (
 type nomadClient struct {
 	http  *http.Client
 	base  string
+	addr  string // as configured, for error messages
 	token string
 }
 
@@ -41,7 +45,7 @@ func newNomadClient(addr, token string) *nomadClient {
 		base = "http://nomad.task.api"
 	}
 
-	return &nomadClient{http: client, base: base, token: token}
+	return &nomadClient{http: client, base: base, addr: addr, token: token}
 }
 
 func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*http.Response, error) {
@@ -58,12 +62,21 @@ func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*h
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, humane.Wrap(err, "could not reach the Nomad API at "+c.addr,
+			"Check that a Nomad agent is listening at the configured address: the -nomad-addr flag, $NOMAD_ADDR, or (inside a Nomad task) the api.sock task API socket.",
+		)
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
-		return nil, fmt.Errorf("GET %s: %s: %s", path, resp.Status, strings.TrimSpace(string(body)))
+		msg := fmt.Sprintf("GET %s: %s: %s", path, resp.Status, strings.TrimSpace(string(body)))
+		if resp.StatusCode == http.StatusForbidden {
+			return nil, humane.New(msg,
+				"With ACLs enabled, the connector's workload identity needs a policy granting read-job across namespaces (plus agent:read when the node ID is auto-detected).",
+				`Apply it with: nomad acl policy apply -namespace default -job tailscale-connector tailscale-connector policy.hcl — see "Grant API access" in docs/tailscale-services.md.`,
+			)
+		}
+		return nil, errors.New(msg)
 	}
 	return resp, nil
 }
@@ -76,7 +89,12 @@ func (c *nomadClient) get(ctx context.Context, path string, query url.Values, v 
 		return err
 	}
 	defer resp.Body.Close()
-	return json.NewDecoder(resp.Body).Decode(v)
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return humane.Wrap(err, "parsing the Nomad API response for GET "+path,
+			"The configured address may not be a Nomad agent's HTTP API; check the -nomad-addr flag and $NOMAD_ADDR.",
+		)
+	}
+	return nil
 }
 
 // serviceListStub is one entry of GET /v1/services: a service name with the
@@ -130,7 +148,9 @@ func (c *nomadClient) localNodeID(ctx context.Context) (string, error) {
 	if id := self.Stats["client"]["node_id"]; id != "" {
 		return id, nil
 	}
-	return "", fmt.Errorf("agent self response contains no client node_id (is this agent a client?)")
+	return "", humane.New("the Nomad agent reports no client node ID",
+		"Point the connector at an agent running in client mode, or skip auto-detection by setting -node-id or $CONNECTOR_NODE_ID (the bundled job does this).",
+	)
 }
 
 // watchEvents follows Nomad's event stream for Service topic events and pokes
@@ -154,10 +174,11 @@ func (c *nomadClient) watchEvents(ctx context.Context, notify chan<- struct{}) {
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(started) > time.Minute {
+		lifetime := time.Since(started)
+		if lifetime > time.Minute {
 			backoff = time.Second
 		}
-		log.Printf("warn: event stream disconnected (%v); reconnecting in %s", err, backoff)
+		log.Printf("warn: event stream disconnected; reconnecting in %s: %s", backoff, display(classifyStreamErr(err, lifetime)))
 		select {
 		case <-ctx.Done():
 			return
@@ -167,6 +188,21 @@ func (c *nomadClient) watchEvents(ctx context.Context, notify chan<- struct{}) {
 			backoff = 30 * time.Second
 		}
 	}
+}
+
+// classifyStreamErr attaches advice to event-stream failures whose cause is
+// invisible client-side. An ACL denial of /v1/event/stream only occurs after
+// the agent has started the streaming response, so the connector sees a bare
+// EOF before the first heartbeat (sent every 30s) rather than a 403 —
+// surface that pattern instead of leaving the user staring at "EOF".
+func classifyStreamErr(err error, lifetime time.Duration) error {
+	if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && lifetime < 30*time.Second {
+		return humane.Wrap(err, "the event stream closed before delivering anything",
+			"When every reconnect dies like this, Nomad ACLs are usually denying the stream; the denial is only logged agent-side — look for a 403 on /v1/event/stream in: nomad monitor -log-level=DEBUG.",
+			`Apply the connector's ACL policy — see "Grant API access" in docs/tailscale-services.md; the connector recovers on its own once it lands.`,
+		)
+	}
+	return err
 }
 
 func (c *nomadClient) streamEvents(ctx context.Context, poke func()) error {

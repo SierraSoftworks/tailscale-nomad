@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	humane "github.com/sierrasoftworks/humane-errors-go"
 	"tailscale.com/tsnet"
 )
 
@@ -71,7 +72,7 @@ func main() {
 		var err error
 		node, err = nomad.localNodeID(ctx)
 		if err != nil {
-			log.Fatalf("unable to determine local node ID (set -node-id or CONNECTOR_NODE_ID): %v", err)
+			log.Fatalf("error: determining local node ID: %s", display(err))
 		}
 	}
 
@@ -82,7 +83,10 @@ func main() {
 	if !*dryRun {
 		if *tsDir != "" {
 			if err := os.MkdirAll(*tsDir, 0o700); err != nil {
-				log.Fatalf("creating tsnet state directory %s: %v", *tsDir, err)
+				log.Fatalf("error: %s", display(humane.Wrap(err,
+					"could not create the tsnet state directory "+*tsDir,
+					"Check the state volume is mounted at this path and writable by the task user — the bundled job mounts the tailscale-connector-state host volume at /data and runs as root.",
+				)))
 			}
 		}
 		srv := &tsnet.Server{
@@ -100,7 +104,11 @@ func main() {
 		// -ts-dir is reused and no key is needed.
 		status, err := srv.Up(ctx)
 		if err != nil {
-			log.Fatalf("joining tailnet (first-time enrolment needs TS_AUTHKEY or TS_CLIENT_SECRET): %v", err)
+			log.Fatalf("error: %s", display(humane.Wrap(err, "could not join the tailnet",
+				"First-time enrolment needs TS_AUTHKEY (a tagged, reusable auth key) or TS_CLIENT_SECRET; the bundled job reads it from a Nomad variable — store it with: nomad var put nomad/jobs/tailscale-connector ts_authkey=tskey-auth-...",
+				"Auth keys expire and single-use keys are consumed; generate a fresh one if in doubt.",
+				"If this node has joined before, its identity lives in the -ts-dir state directory; make sure that volume persists across restarts.",
+			)))
 		}
 		self := *tsHostname
 		if status != nil && status.Self != nil && status.Self.DNSName != "" {
@@ -115,7 +123,7 @@ func main() {
 	pass := func() {
 		desired, err := gather(ctx, nomad, node, *tagPrefix)
 		if err != nil {
-			log.Printf("warn: skipping reconcile, could not list Nomad services: %v", err)
+			log.Printf("warn: skipping reconcile, could not list Nomad services: %s", display(err))
 			return
 		}
 		rec.reconcile(desired)
@@ -228,7 +236,12 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (
 				continue
 			}
 			if reg.Address == "" || reg.Port == 0 {
-				log.Printf("warn: service %s/%s has no address/port; not published", ns.Namespace, stub.ServiceName)
+				log.Printf("warn: %s", display(humane.New(
+					fmt.Sprintf("service %s/%s is registered without a usable address/port; not published", ns.Namespace, stub.ServiceName),
+					`Set port = "<label>" on the service block, with that label defined in the group's network block.`,
+					`Docker tasks with a custom network_mode register the container IP with port 0; add address_mode = "host" to the service block so the host-published address is registered instead.`,
+					"Inspect what Nomad registered with: nomad service info "+stub.ServiceName,
+				)))
 				continue
 			}
 
@@ -245,7 +258,10 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (
 				// Only one listener can exist per Service port on this host.
 				portKey := fmt.Sprintf("%s/%d", want.Service, want.Port)
 				if prev, dup := claimed[portKey]; dup {
-					log.Printf("warn: service %s: %s port %d already claimed by %s; ignoring", qualified, want.Service, want.Port, prev)
+					log.Printf("warn: %s", display(humane.New(
+						fmt.Sprintf("service %s: %s port %d already claimed by %s; ignoring", qualified, want.Service, want.Port, prev),
+						"Only one backend can serve a given Service port on a node; give one of the services a different tailscale.service name or a different port.",
+					)))
 					continue
 				}
 				claimed[portKey] = qualified

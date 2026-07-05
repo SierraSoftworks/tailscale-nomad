@@ -9,6 +9,15 @@
 # tagged Tailscale auth key stored in a Nomad variable (see the template
 # block below).
 
+# The connector release to install, e.g.:
+#
+#   nomad job run -var version=0.1.1 tailscale-connector.nomad.hcl
+variable "version" {
+  type        = string
+  default     = "0.1.0"
+  description = "Connector release to install (GitHub release tag v<version>)."
+}
+
 job "tailscale-connector" {
   type = "system"
 
@@ -72,9 +81,9 @@ job "tailscale-connector" {
 
       artifact {
         # ${attr.cpu.arch} resolves to amd64 on x86_64 nodes and arm64 on
-        # aarch64 nodes. Pin the version (and ideally a checksum) you intend
-        # to run; releases are tagged v<version>.
-        source = "https://github.com/SierraSoftworks/tailscale-nomad/releases/download/v0.1.0/nomad-tailscale-connector_0.1.0_linux_${attr.cpu.arch}.tar.gz"
+        # aarch64 nodes; the release version comes from the job's "version"
+        # variable above.
+        source = "https://github.com/SierraSoftworks/tailscale-nomad/releases/download/v${var.version}/nomad-tailscale-connector_${var.version}_linux_${attr.cpu.arch}.tar.gz"
       }
 
       config {

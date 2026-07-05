@@ -169,10 +169,16 @@ nomad job run jobs/tailscale-connector.nomad.hcl
 
 The job downloads a pinned connector release for the node's architecture and
 reaches the local Nomad agent through the task API socket using its workload
-identity — no API address or token configuration needed. Each node appears
-in your tailnet as `nomad-<node-name>`. On nodes without the state volume
-(e.g. other clients in a mixed cluster), the system job simply doesn't place
-an allocation.
+identity — no API address or token configuration needed. The release version
+is a job variable, so upgrades are a re-run away:
+
+```sh
+nomad job run -var version=0.1.1 jobs/tailscale-connector.nomad.hcl
+```
+
+Each node appears in your tailnet as `nomad-<node-name>`. On nodes without
+the state volume (e.g. other clients in a mixed cluster), the system job
+simply doesn't place an allocation.
 
 ### 5. Tag your services
 
@@ -264,6 +270,10 @@ client secret), read by tsnet itself.
   on the next reconcile pass.
 
 ## Troubleshooting
+
+When something fails, the connector's log lines carry indented `hint:` lines
+with the most likely fixes — start there. The notes below cover the same
+ground in more detail.
 
 ```sh
 # Connector logs — look for "joined tailnet as ..." and "published ..."

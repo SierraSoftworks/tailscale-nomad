@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	humane "github.com/sierrasoftworks/humane-errors-go"
 	"tailscale.com/tsnet"
 )
 
@@ -61,7 +62,12 @@ func (p *tsnetPublisher) Publish(ep desiredEndpoint) (publishedEndpoint, error) 
 
 	ln, err := p.srv.ListenService(ep.Service, mode)
 	if err != nil {
-		return nil, err
+		return nil, humane.Wrap(err, "the tailnet refused the Service advertisement",
+			"Define the Service in the admin console first (Services → Add service) — the connector advertises hosts for existing Services; it does not create them.",
+			"Service hosts must be tagged devices: enrol the connector with a tagged auth key (or set -ts-tags).",
+			`Advertisements may need approval: add an autoApprovers rule for "`+ep.Service+`" to the tailnet policy, or approve it in the admin console.`,
+			"A valid host must advertise every port in the Service's definition; keep the tailscale.* protocol tags in sync with it.",
+		)
 	}
 	if ln.FQDN != "" {
 		log.Printf("%s is reachable at %s (port %d, %s)", ep.Service, ln.FQDN, ep.Port, ep.Proto)
@@ -175,7 +181,10 @@ func (e *tcpEndpoint) proxyConn(client net.Conn) {
 	addr := e.backend.Load().(string)
 	backend, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		log.Printf("warn: %s: dialing backend %s: %v", e.desc, addr, err)
+		log.Printf("warn: %s", display(humane.Wrap(err,
+			fmt.Sprintf("%s: could not dial backend %s", e.desc, addr),
+			"Confirm the backing task is listening on its registered address (nomad service info <name>); a brief gap during a redeploy is normal.",
+		)))
 		return
 	}
 	e.track(backend)

@@ -107,7 +107,7 @@ func (r *reconciler) reconcile(desired []desiredEndpoint) {
 		}
 		pe, err := r.pub.Publish(ep)
 		if err != nil {
-			log.Printf("error: publishing %s: %v (will retry)", ep, err)
+			log.Printf("error: publishing %s (will retry): %s", ep, display(err))
 			continue
 		}
 		log.Printf("published %s -> %s", ep, ep.Backend)
