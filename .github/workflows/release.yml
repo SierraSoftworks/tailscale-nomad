@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release ${TAG} already exists." >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: go vet ./... && go test ./...
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o dist/nomad-tailscale-connector .
+            tar -C dist -czf "dist/nomad-tailscale-connector_${VERSION}_linux_${arch}.tar.gz" nomad-tailscale-connector
+            rm dist/nomad-tailscale-connector
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "nomad-tailscale-connector ${VERSION}" \
+            --notes "Publishes Nomad services as Tailscale Services. Deploy as a Nomad system job — see [docs/tailscale-services.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/tailscale-services.md).
+
+          The \`linux_amd64\` build is for x86_64 nodes and \`linux_arm64\` for aarch64 nodes; the bundled job file selects the right one via \`\${attr.cpu.arch}\`." \
+            dist/nomad-tailscale-connector_${VERSION}_linux_amd64.tar.gz \
+            dist/nomad-tailscale-connector_${VERSION}_linux_arm64.tar.gz \
+            dist/SHA256SUMS

@@ -1,0 +1,6 @@
+dist/
+.DS_Store
+
+# Compiled connector binaries
+/nomad-tailscale-connector
+/tailscale-nomad
