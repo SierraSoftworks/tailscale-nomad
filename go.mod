@@ -3,7 +3,7 @@ module github.com/SierraSoftworks/tailscale-nomad
 go 1.26.4
 
 require (
-	github.com/sierrasoftworks/humane-errors-go v0.0.0-20260619132337-5754e417d028
+	github.com/sierrasoftworks/humane-errors-go v0.0.0-20260705193506-72c7fe6b3526
 	tailscale.com v1.100.0
 )
 

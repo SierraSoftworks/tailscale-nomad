@@ -152,8 +152,8 @@ github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0t
 github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
 github.com/safchain/ethtool v0.3.0 h1:gimQJpsI6sc1yIqP/y8GYgiXn/NjgvpM0RNoWLVVmP0=
 github.com/safchain/ethtool v0.3.0/go.mod h1:SA9BwrgyAqNo7M+uaL6IYbxpm5wk3L7Mm6ocLW+CJUs=
-github.com/sierrasoftworks/humane-errors-go v0.0.0-20260619132337-5754e417d028 h1:lUdZf9bqzEYusXTezTK+4qrFseiItlcKqJBw9Kb+khA=
-github.com/sierrasoftworks/humane-errors-go v0.0.0-20260619132337-5754e417d028/go.mod h1:98WJMvl0Bvx/4pvShkeT0281OIJX6u6t1khQnMXjctg=
+github.com/sierrasoftworks/humane-errors-go v0.0.0-20260705193506-72c7fe6b3526 h1:Q4hsWD6gs9WzaNOdpUwAhXGXp5N5EGSLU7zJMJEZ5PI=
+github.com/sierrasoftworks/humane-errors-go v0.0.0-20260705193506-72c7fe6b3526/go.mod h1:98WJMvl0Bvx/4pvShkeT0281OIJX6u6t1khQnMXjctg=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d h1:JcGKBZAL7ePLwOhUdN8qGQZlP5GueEiIZwY7R62pejE=
