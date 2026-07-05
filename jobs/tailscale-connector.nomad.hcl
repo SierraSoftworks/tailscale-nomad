@@ -85,6 +85,18 @@ job "tailscale-connector" {
         ]
       }
 
+      # Smoke test from inside the running allocation — prints exactly what
+      # the connector sees and would publish, without joining the tailnet:
+      #
+      #   nomad action -job tailscale-connector -group connector -task connector dry-run
+      #
+      # (With ACLs enabled, invoking it needs alloc-exec, read-job, and
+      # list-jobs on the job's namespace.)
+      action "dry-run" {
+        command = "local/nomad-tailscale-connector"
+        args    = ["-once", "-dry-run"]
+      }
+
       # Must exceed -shutdown-grace (default 20s) so in-flight connections
       # can finish before the task is killed.
       kill_timeout = "30s"

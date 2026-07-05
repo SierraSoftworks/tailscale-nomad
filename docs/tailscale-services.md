@@ -119,7 +119,46 @@ nomad var put nomad/jobs/tailscale-connector ts_authkey=tskey-auth-...
 Once a node has joined, its identity lives in the state volume and the key
 is no longer read (nodes added later still need it).
 
-### 3. Deploy the connector
+### 3. Grant API access (ACL-enabled clusters only)
+
+The connector authenticates to the local agent with the job's workload
+identity. With ACLs enabled that identity has almost no permissions out of
+the box, which breaks the connector in two ways at once: the event stream
+subscription is **denied outright** — the connector sees only the connection
+closing and logs a repeating `event stream disconnected (EOF)` loop, while
+the agent's debug log shows the real reason
+(`403` on `/v1/event/stream`) — and service listings are **silently
+filtered to nothing** rather than erroring, so no services are ever
+published.
+
+Attach a policy to the job's workload identity granting read access across
+namespaces:
+
+```hcl
+# tailscale-connector-policy.hcl
+namespace "*" {
+  capabilities = ["read-job"]
+}
+
+# Only needed when the connector auto-detects its node ID; the bundled job
+# pins CONNECTOR_NODE_ID instead, so this block can be dropped.
+agent {
+  policy = "read"
+}
+```
+
+```sh
+nomad acl policy apply \
+  -namespace default -job tailscale-connector \
+  tailscale-connector ./tailscale-connector-policy.hcl
+```
+
+The policy applies to the job's identity directly — no token to mint or
+distribute — and takes effect on the connector's next reconnect and
+reconcile pass (within a minute); no restart needed. Skip this step
+entirely if your cluster does not use ACLs.
+
+### 4. Deploy the connector
 
 Deploy [jobs/tailscale-connector.nomad.hcl](../jobs/tailscale-connector.nomad.hcl),
 a system job that runs one connector per client node:
@@ -135,10 +174,7 @@ in your tailnet as `nomad-<node-name>`. On nodes without the state volume
 (e.g. other clients in a mixed cluster), the system job simply doesn't place
 an allocation.
 
-If your cluster has ACLs enabled, attach a policy to the job's workload
-identity granting read access to services and the agent.
-
-### 4. Tag your services
+### 5. Tag your services
 
 ```hcl
 group "app" {
@@ -233,12 +269,26 @@ client secret), read by tsnet itself.
 # Connector logs — look for "joined tailnet as ..." and "published ..."
 nomad alloc logs -job tailscale-connector
 
-# Dry-run by hand (over SSH): shows exactly what would be published
+# Smoke test inside a running allocation: a single dry-run pass using the
+# task's own socket, token, and node ID — prints exactly what the connector
+# sees and would publish (needs alloc-exec on the namespace when ACLs are on)
+nomad action -job tailscale-connector -group connector -task connector dry-run
+
+# The same dry-run by hand (over SSH), e.g. before first deployment
 /path/to/nomad-tailscale-connector -once -dry-run \
   -nomad-addr=http://127.0.0.1:4646 \
   -node-id="$(nomad node status -self -json | jq -r .ID)"
 ```
 
+- **`event stream disconnected (EOF)` repeating, and nothing publishes** —
+  the cluster has ACLs enabled and the workload identity lacks read access.
+  The stream denial only surfaces client-side as the connection closing;
+  `nomad monitor -log-level=DEBUG` shows the real error
+  (`403` on `/v1/event/stream`), and service listings come back empty
+  instead of erroring. Apply the ACL policy from the setup section — the
+  connector recovers on its own within a minute. (Occasional stream EOFs
+  with successful reconnects are harmless; a tight loop that never settles
+  is the ACL signature.)
 - **`service hosts must be tagged nodes`** — the connector's device is
   untagged: use a tagged auth key (or set `-ts-tags` with a tag the key may
   advertise).
