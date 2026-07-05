@@ -57,7 +57,7 @@ jobs:
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "nomad-tailscale-connector ${VERSION}" \
-            --notes "Publishes Nomad services as Tailscale Services. Deploy as a Nomad system job — see [docs/tailscale-services.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/tailscale-services.md).
+            --notes "Publishes Nomad services as Tailscale Services. Deploy as a Nomad system job — see the [README](https://github.com/${GITHUB_REPOSITORY}#readme) for the full setup guide.
 
           The \`linux_amd64\` build is for x86_64 nodes and \`linux_arm64\` for aarch64 nodes; the bundled job file selects the right one via \`\${attr.cpu.arch}\`." \
             dist/nomad-tailscale-connector_${VERSION}_linux_amd64.tar.gz \

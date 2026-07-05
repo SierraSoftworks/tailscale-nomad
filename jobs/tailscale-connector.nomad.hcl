@@ -3,7 +3,7 @@
 #
 # The connector joins the tailnet as its own userspace (tsnet) device and
 # hosts Services directly — it needs no Tailscale package, daemon socket, or
-# CLI on the host. See docs/tailscale-services.md for the full setup guide.
+# CLI on the host. See the README for the full setup guide.
 #
 # Requires a Nomad client running as root (for the exec driver) and a
 # tagged Tailscale auth key stored in a Nomad variable (see the template

@@ -73,7 +73,7 @@ func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*h
 		if resp.StatusCode == http.StatusForbidden {
 			return nil, humane.New(msg,
 				"With ACLs enabled, the connector's workload identity needs a policy granting read-job across namespaces (plus agent:read when the node ID is auto-detected).",
-				`Apply it with: nomad acl policy apply -namespace default -job tailscale-connector tailscale-connector policy.hcl — see "Grant API access" in docs/tailscale-services.md.`,
+				`Apply it with: nomad acl policy apply -namespace default -job tailscale-connector tailscale-connector policy.hcl — see "Grant API access" in the README.`,
 			)
 		}
 		return nil, errors.New(msg)
@@ -199,7 +199,7 @@ func classifyStreamErr(err error, lifetime time.Duration) error {
 	if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && lifetime < 30*time.Second {
 		return humane.Wrap(err, "the event stream closed before delivering anything",
 			"When every reconnect dies like this, Nomad ACLs are usually denying the stream; the denial is only logged agent-side — look for a 403 on /v1/event/stream in: nomad monitor -log-level=DEBUG.",
-			`Apply the connector's ACL policy — see "Grant API access" in docs/tailscale-services.md; the connector recovers on its own once it lands.`,
+			`Apply the connector's ACL policy — see "Grant API access" in the README; the connector recovers on its own once it lands.`,
 		)
 	}
 	return err
