@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // desiredEndpoint is one tailnet-facing endpoint the connector should serve,
@@ -76,12 +81,19 @@ func newReconciler(pub publisher, drainGrace time.Duration) *reconciler {
 //     replacement allocation) are repointed without dropping the listener;
 //   - drained endpoints are force-closed once idle or after the drain grace.
 //
-// Failed publishes are retried on subsequent passes.
-func (r *reconciler) reconcile(desired []desiredEndpoint) {
+// Failed publishes are retried on subsequent passes. It runs as a child span
+// of the reconcile pass, recording per-pass counts as span attributes and
+// metrics.
+func (r *reconciler) reconcile(ctx context.Context, desired []desiredEndpoint) {
+	ctx, span := tracer.Start(ctx, "apply")
+	defer span.End()
+
 	want := map[string]desiredEndpoint{}
 	for _, ep := range desired {
 		want[ep.key()] = ep
 	}
+
+	var published, withdrawn, moved, failed int
 
 	// Drain first so a re-shaped endpoint (e.g. a changed path) can re-bind
 	// its port in the publish loop below.
@@ -90,9 +102,12 @@ func (r *reconciler) reconcile(desired []desiredEndpoint) {
 			continue
 		}
 		entry.pe.Drain()
-		log.Printf("%s deregistered; drained (existing connections get %s to finish)", entry.spec, r.drainGrace)
+		logf(ctx, levelInfo, "%s deregistered; drained (existing connections get %s to finish)", entry.spec, r.drainGrace)
+		span.AddEvent("drained", trace.WithAttributes(endpointAttrs(entry.spec)...))
 		r.draining = append(r.draining, drainingEndpoint{spec: entry.spec, pe: entry.pe, since: r.now()})
 		delete(r.active, k)
+		withdrawn++
+		mEndpointsWithdrawn.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", "deregistered")))
 	}
 
 	for _, ep := range desired {
@@ -100,31 +115,65 @@ func (r *reconciler) reconcile(desired []desiredEndpoint) {
 		if entry, ok := r.active[k]; ok {
 			if entry.spec.Backend != ep.Backend {
 				entry.pe.SetBackend(ep.Backend)
-				log.Printf("%s backend moved %s -> %s", ep, entry.spec.Backend, ep.Backend)
+				logf(ctx, levelInfo, "%s backend moved %s -> %s", ep, entry.spec.Backend, ep.Backend)
+				span.AddEvent("backend moved", trace.WithAttributes(endpointAttrs(ep)...))
 				entry.spec.Backend = ep.Backend
+				moved++
+				mBackendMoves.Add(ctx, 1)
 			}
 			continue
 		}
-		pe, err := r.pub.Publish(ep)
+		pe, err := r.publish(ctx, ep)
 		if err != nil {
-			log.Printf("error: publishing %s (will retry): %s", ep, display(err))
+			logf(ctx, levelError, "publishing %s (will retry): %s", ep, display(err))
+			failed++
 			continue
 		}
-		log.Printf("published %s -> %s", ep, ep.Backend)
+		logf(ctx, levelInfo, "published %s -> %s", ep, ep.Backend)
 		r.active[k] = &activeEndpoint{spec: ep, pe: pe}
+		published++
 	}
 
-	r.sweepDraining(false)
+	r.sweepDraining(ctx, false)
+
+	span.SetAttributes(
+		attribute.Int("connector.endpoints.published", published),
+		attribute.Int("connector.endpoints.withdrawn", withdrawn),
+		attribute.Int("connector.endpoints.backend_moves", moved),
+		attribute.Int("connector.endpoints.publish_failures", failed),
+		attribute.Int("connector.endpoints.active", len(r.active)),
+		attribute.Int("connector.endpoints.draining", len(r.draining)),
+	)
+	if published > 0 {
+		mEndpointsPublished.Add(ctx, int64(published))
+	}
+	mEndpointsActive.Record(ctx, int64(len(r.active)))
+	mEndpointsDraining.Record(ctx, int64(len(r.draining)))
+}
+
+// publish opens a listener for one endpoint, wrapped in its own span so a slow
+// or failing advertisement is visible per endpoint.
+func (r *reconciler) publish(ctx context.Context, ep desiredEndpoint) (publishedEndpoint, error) {
+	ctx, span := tracer.Start(ctx, "publish", trace.WithAttributes(endpointAttrs(ep)...))
+	defer span.End()
+
+	pe, err := r.pub.Publish(ep)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish failed")
+		mPublishFailures.Add(ctx, 1, metric.WithAttributes(attribute.String("tailscale.protocol", ep.Proto)))
+	}
+	return pe, err
 }
 
 // sweepDraining force-closes draining endpoints that are idle or whose grace
 // has passed (or all of them, when force is set).
-func (r *reconciler) sweepDraining(force bool) {
+func (r *reconciler) sweepDraining(ctx context.Context, force bool) {
 	keep := r.draining[:0]
 	for _, d := range r.draining {
 		if force || d.pe.Idle() || r.now().Sub(d.since) >= r.drainGrace {
 			d.pe.Close()
-			log.Printf("removed %s", d.spec)
+			logf(ctx, levelInfo, "removed %s", d.spec)
 			continue
 		}
 		keep = append(keep, d)
@@ -150,20 +199,29 @@ func (r *reconciler) nextDeadline() (time.Time, bool) {
 // connections to finish, then force-closes the rest. Unlike the CLI-driven
 // design this connector *is* the data path, so shutting it down necessarily
 // ends the connections it carries.
-func (r *reconciler) shutdown(grace time.Duration) {
+func (r *reconciler) shutdown(ctx context.Context, grace time.Duration) {
+	ctx, span := tracer.Start(ctx, "shutdown", trace.WithAttributes(
+		attribute.Int("connector.endpoints.active", len(r.active)),
+		attribute.Float64("connector.shutdown.grace_seconds", grace.Seconds()),
+	))
+	defer span.End()
+
 	for k, entry := range r.active {
 		entry.pe.Drain()
 		r.draining = append(r.draining, drainingEndpoint{spec: entry.spec, pe: entry.pe, since: r.now()})
 		delete(r.active, k)
+		mEndpointsWithdrawn.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", "shutdown")))
 	}
+	mEndpointsActive.Record(ctx, 0)
 
 	deadline := r.now().Add(grace)
 	for {
-		r.sweepDraining(false)
+		r.sweepDraining(ctx, false)
 		if len(r.draining) == 0 || !r.now().Before(deadline) {
 			break
 		}
 		r.sleep(250 * time.Millisecond)
 	}
-	r.sweepDraining(true)
+	r.sweepDraining(ctx, true)
+	mEndpointsDraining.Record(ctx, int64(len(r.draining)))
 }

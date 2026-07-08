@@ -1,10 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -70,7 +70,7 @@ func (p *tsnetPublisher) Publish(ep desiredEndpoint) (publishedEndpoint, error) 
 		)
 	}
 	if ln.FQDN != "" {
-		log.Printf("%s is reachable at %s (port %d, %s)", ep.Service, ln.FQDN, ep.Port, ep.Proto)
+		logf(context.Background(), levelInfo, "%s is reachable at %s (port %d, %s)", ep.Service, ln.FQDN, ep.Port, ep.Proto)
 	}
 
 	switch ep.Proto {
@@ -128,7 +128,7 @@ func newHTTPEndpoint(ep desiredEndpoint, ln net.Listener) *httpEndpoint {
 	go func() {
 		err := e.srv.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			log.Printf("warn: http serving for %s ended: %v", ep, err)
+			logf(context.Background(), levelWarn, "http serving for %s ended: %v", ep, err)
 		}
 	}()
 	return e
@@ -181,7 +181,7 @@ func (e *tcpEndpoint) proxyConn(client net.Conn) {
 	addr := e.backend.Load().(string)
 	backend, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		log.Printf("warn: %s", display(humane.Wrap(err,
+		logf(context.Background(), levelWarn, "%s", display(humane.Wrap(err,
 			fmt.Sprintf("%s: could not dial backend %s", e.desc, addr),
 			"Confirm the backing task is listening on its registered address (nomad service info <name>); a brief gap during a redeploy is normal.",
 		)))
@@ -246,13 +246,15 @@ type dryRunPublisher struct{}
 type dryRunEndpoint struct{ desc string }
 
 func (dryRunPublisher) Publish(ep desiredEndpoint) (publishedEndpoint, error) {
-	log.Printf("dry-run: would publish %s -> %s", ep, ep.Backend)
+	logf(context.Background(), levelInfo, "dry-run: would publish %s -> %s", ep, ep.Backend)
 	return &dryRunEndpoint{desc: ep.String()}, nil
 }
 
 func (e *dryRunEndpoint) SetBackend(backend string) {
-	log.Printf("dry-run: would repoint %s -> %s", e.desc, backend)
+	logf(context.Background(), levelInfo, "dry-run: would repoint %s -> %s", e.desc, backend)
 }
-func (e *dryRunEndpoint) Drain()     { log.Printf("dry-run: would drain %s", e.desc) }
+func (e *dryRunEndpoint) Drain() {
+	logf(context.Background(), levelInfo, "dry-run: would drain %s", e.desc)
+}
 func (e *dryRunEndpoint) Idle() bool { return true }
 func (e *dryRunEndpoint) Close()     {}

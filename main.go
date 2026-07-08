@@ -31,12 +31,25 @@ import (
 	"time"
 
 	humane "github.com/sierrasoftworks/humane-errors-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"tailscale.com/tsnet"
 )
 
 var version = "dev"
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	// Logging works from the first line; telemetry (and the log bridge) is
+	// attached later once the node ID is known and the operator's OTEL_*
+	// configuration has been read.
+	installLogger(nil)
+
 	var (
 		nomadAddr     = flag.String("nomad-addr", "", "Nomad API address (default: $NOMAD_ADDR, else the task API socket, else http://127.0.0.1:4646)")
 		nodeID        = flag.String("node-id", "", "Nomad node ID whose services are published (default: $CONNECTOR_NODE_ID, else auto-detected from the local agent)")
@@ -55,7 +68,7 @@ func main() {
 
 	if *showVersion {
 		fmt.Println(version)
-		return
+		return 0
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -72,21 +85,38 @@ func main() {
 		var err error
 		node, err = nomad.localNodeID(ctx)
 		if err != nil {
-			log.Fatalf("error: determining local node ID: %s", display(err))
+			logf(ctx, levelError, "determining local node ID: %s", display(err))
+			return 1
 		}
 	}
 
-	log.Printf("nomad-tailscale-connector %s: nomad=%s node=%s tag-prefix=%s drain-grace=%s dry-run=%v",
+	// From here on, spans, metrics, and (a bridge to) logs flow to whatever
+	// exporters the OTEL_* environment selects; without that configuration
+	// this is a no-op and only the console logger runs.
+	tel, terr := setupTelemetry(ctx, version, node)
+	if terr != nil {
+		logf(ctx, levelWarn, "%s", display(terr))
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tel.shutdown(sctx); err != nil {
+			baseConsole.Warn("telemetry shutdown: " + err.Error())
+		}
+	}()
+
+	logf(ctx, levelInfo, "nomad-tailscale-connector %s: nomad=%s node=%s tag-prefix=%s drain-grace=%s dry-run=%v",
 		version, addr, node, *tagPrefix, *drainGrace, *dryRun)
 
 	var pub publisher = dryRunPublisher{}
 	if !*dryRun {
 		if *tsDir != "" {
 			if err := os.MkdirAll(*tsDir, 0o700); err != nil {
-				log.Fatalf("error: %s", display(humane.Wrap(err,
+				logf(ctx, levelError, "%s", display(humane.Wrap(err,
 					"could not create the tsnet state directory "+*tsDir,
 					"Check the state volume is mounted at this path and writable by the task user — the bundled job mounts the tailscale-connector-state host volume at /data and runs as root.",
 				)))
+				return 1
 			}
 		}
 		srv := &tsnet.Server{
@@ -104,45 +134,77 @@ func main() {
 		// -ts-dir is reused and no key is needed.
 		status, err := srv.Up(ctx)
 		if err != nil {
-			log.Fatalf("error: %s", display(humane.Wrap(err, "could not join the tailnet",
+			logf(ctx, levelError, "%s", display(humane.Wrap(err, "could not join the tailnet",
 				"First-time enrolment needs TS_AUTHKEY (a tagged, reusable auth key) or TS_CLIENT_SECRET; the bundled job reads it from a Nomad variable — store it with: nomad var put nomad/jobs/tailscale-connector ts_authkey=tskey-auth-...",
 				"Auth keys expire and single-use keys are consumed; generate a fresh one if in doubt.",
 				"If this node has joined before, its identity lives in the -ts-dir state directory; make sure that volume persists across restarts.",
 			)))
+			return 1
 		}
 		self := *tsHostname
 		if status != nil && status.Self != nil && status.Self.DNSName != "" {
 			self = strings.TrimSuffix(status.Self.DNSName, ".")
 		}
-		log.Printf("joined tailnet as %s", self)
+		logf(ctx, levelInfo, "joined tailnet as %s", self)
 		pub = &tsnetPublisher{srv: srv}
 	}
 
 	rec := newReconciler(pub, *drainGrace)
 
-	pass := func() {
+	// pass runs one reconcile as a short-lived, self-contained trace rooted
+	// here: gathering Nomad's services and converging the published endpoints
+	// become child spans of this one. trigger records what woke the pass
+	// (startup, an event-stream notification, the periodic interval, or a
+	// draining deadline) so traces and metrics can be sliced by cause.
+	pass := func(ctx context.Context, trigger string) {
+		ctx, span := tracer.Start(ctx, "reconcile", trace.WithAttributes(
+			attribute.String("connector.trigger", trigger),
+			attribute.String("nomad.node.id", node),
+		))
+		defer span.End()
+
+		started := time.Now()
+		outcome := "success"
 		desired, err := gather(ctx, nomad, node, *tagPrefix)
 		if err != nil {
-			log.Printf("warn: skipping reconcile, could not list Nomad services: %s", display(err))
-			return
+			outcome = "error"
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "gather failed")
+			logf(ctx, levelWarn, "skipping reconcile, could not list Nomad services: %s", display(err))
+		} else {
+			span.SetAttributes(attribute.Int("connector.endpoints.desired", len(desired)))
+			rec.reconcile(ctx, desired)
 		}
-		rec.reconcile(desired)
+
+		span.SetAttributes(attribute.String("connector.outcome", outcome))
+		mReconcilePasses.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("trigger", trigger),
+			attribute.String("outcome", outcome),
+		))
+		mReconcileDuration.Record(ctx, time.Since(started).Seconds(),
+			metric.WithAttributes(attribute.String("trigger", trigger)))
 	}
 
-	pass()
+	startTrigger := "startup"
 	if *once {
-		rec.shutdown(*shutdownGrace)
-		return
+		startTrigger = "once"
+	}
+	pass(ctx, startTrigger)
+	if *once {
+		rec.shutdown(ctx, *shutdownGrace)
+		return 0
 	}
 
 	events := make(chan struct{}, 1)
 	go nomad.watchEvents(ctx, events)
 
 	for {
+		trigger := "interval"
 		wait := *interval
 		if deadline, ok := rec.nextDeadline(); ok {
 			if until := time.Until(deadline); until < wait {
 				wait = until
+				trigger = "deadline"
 			}
 		}
 		if wait < 250*time.Millisecond {
@@ -153,10 +215,13 @@ func main() {
 		case <-ctx.Done():
 			// The connector is the data path for the Services it hosts, so
 			// give in-flight connections a chance to finish before exiting.
-			log.Printf("shutting down: draining %d endpoint(s)", len(rec.active))
-			rec.shutdown(*shutdownGrace)
-			return
+			// Shut down under a fresh context: the signalled one is already
+			// cancelled, but the drain span and its export are still wanted.
+			logf(context.Background(), levelInfo, "shutting down: draining %d endpoint(s)", len(rec.active))
+			rec.shutdown(context.Background(), *shutdownGrace)
+			return 0
 		case <-events:
+			trigger = "event"
 			// Debounce bursts (e.g. a deployment replacing several allocs).
 			select {
 			case <-ctx.Done():
@@ -165,7 +230,7 @@ func main() {
 		case <-time.After(wait):
 		}
 
-		pass()
+		pass(ctx, trigger)
 	}
 }
 
@@ -189,14 +254,26 @@ func resolveNomadAddr(flagVal string) string {
 }
 
 // gather queries Nomad for native services carrying the enable tag and turns
-// the registrations placed on this node into the desired set of endpoints.
-func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) ([]desiredEndpoint, error) {
+// the registrations placed on this node into the desired set of endpoints. It
+// runs as a child span of the reconcile pass, with the underlying Nomad API
+// calls nested beneath it.
+func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (desired []desiredEndpoint, err error) {
+	ctx, span := tracer.Start(ctx, "gather")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "gather failed")
+		} else {
+			span.SetAttributes(attribute.Int("connector.endpoints.desired", len(desired)))
+		}
+		span.End()
+	}()
+
 	namespaces, err := nomad.listServices(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var desired []desiredEndpoint
 	claimed := map[string]string{} // "svc:<name>/<port>" -> nomad service that claimed it
 
 	for _, ns := range namespaces {
@@ -224,19 +301,19 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (
 			sort.Slice(local, func(i, j int) bool { return local[i].CreateIndex > local[j].CreateIndex })
 			reg := local[0]
 			if len(local) > 1 {
-				log.Printf("warn: service %s/%s has %d allocations on this node; only alloc %s is published",
+				logf(ctx, levelWarn, "service %s/%s has %d allocations on this node; only alloc %s is published",
 					ns.Namespace, stub.ServiceName, len(local), reg.AllocID)
 			}
 
 			spec, warns := parseTags(tagPrefix, stub.ServiceName, reg.Tags)
 			for _, w := range warns {
-				log.Printf("warn: service %s/%s: %s", ns.Namespace, stub.ServiceName, w)
+				logf(ctx, levelWarn, "service %s/%s: %s", ns.Namespace, stub.ServiceName, w)
 			}
 			if spec == nil {
 				continue
 			}
 			if reg.Address == "" || reg.Port == 0 {
-				log.Printf("warn: %s", display(humane.New(
+				logf(ctx, levelWarn, "%s", display(humane.New(
 					fmt.Sprintf("service %s/%s is registered without a usable address/port; not published", ns.Namespace, stub.ServiceName),
 					`Set port = "<label>" on the service block, with that label defined in the group's network block.`,
 					`Docker tasks with a custom network_mode register the container IP with port 0; add address_mode = "host" to the service block so the host-published address is registered instead.`,
@@ -258,7 +335,7 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (
 				// Only one listener can exist per Service port on this host.
 				portKey := fmt.Sprintf("%s/%d", want.Service, want.Port)
 				if prev, dup := claimed[portKey]; dup {
-					log.Printf("warn: %s", display(humane.New(
+					logf(ctx, levelWarn, "%s", display(humane.New(
 						fmt.Sprintf("service %s: %s port %d already claimed by %s; ignoring", qualified, want.Service, want.Port, prev),
 						"Only one backend can serve a given Service port on a node; give one of the services a different tailscale.service name or a different port.",
 					)))

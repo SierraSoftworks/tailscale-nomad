@@ -251,6 +251,43 @@ backends on one port is not supported).
 Enrolment credentials come from `TS_AUTHKEY` or `TS_CLIENT_SECRET` (an OAuth
 client secret), read by tsnet itself.
 
+## Observability
+
+The connector emits OpenTelemetry **traces, metrics, and logs**, configured
+through the standard `OTEL_*` environment variables. It is **off by default**:
+with none of those variables set, no providers are installed and nothing tries
+to reach a collector — the connector just logs to stderr as before. Export
+turns on as soon as you point it at a collector:
+
+```sh
+# Enable all three signals (OTLP to a collector on the same host).
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+OTEL_SERVICE_NAME=nomad-tailscale-connector   # optional; this is the default
+```
+
+- **Traces are short-lived and rooted in event handling.** Each reconcile pass
+  — woken by a Nomad event-stream notification, the periodic interval, a drain
+  deadline, or startup — is one self-contained trace, tagged with a
+  `connector.trigger` attribute. Gathering services from Nomad (and each Nomad
+  API call under it) and publishing endpoints are child spans. There is no
+  process-lifetime root span; the long-lived event stream deliberately gets
+  none.
+- **Metrics** cover reconcile passes and duration, active/draining endpoint
+  gauges, publish/withdraw/backend-move counts, publish failures, Nomad API
+  request duration, and event-stream connectivity (`connector.*`).
+- **Logs** are the same lines you see on the console, bridged to OTLP with
+  severity and — when emitted inside a reconcile — the trace and span IDs, so a
+  log line links back to the pass that produced it. Console output is
+  unchanged; set `CONNECTOR_LOG_LEVEL` (`debug`/`info`/`warn`/`error`, default
+  `info`) to adjust verbosity.
+
+Standard knobs apply: `OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc` or `http/protobuf`),
+per-signal endpoints and exporters (`OTEL_TRACES_EXPORTER`,
+`OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` — set one to `none` to disable
+just that signal, or `console` to print it for debugging),
+`OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_SDK_DISABLED=true` to force everything
+off. In the bundled job, add the variables to the task's `env` block.
+
 ## Behaviour notes
 
 - **The connector is the data path.** Service traffic flows tailnet →
