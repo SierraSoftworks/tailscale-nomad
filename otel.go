@@ -219,11 +219,16 @@ func buildResource(ctx context.Context, serviceVersion, nodeID string) (*resourc
 		attrs = append(attrs, attribute.String("nomad.node.id", nodeID))
 	}
 
+	// Detectors are applied low-to-high precedence: later ones win on
+	// conflict. WithFromEnv() comes last so an operator's
+	// OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME override everything —
+	// notably host.name, which the bundled job points at the Nomad node name
+	// rather than the exec sandbox's hostname (see the job definition).
 	res, err := resource.New(ctx,
-		resource.WithFromEnv(),      // OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES
-		resource.WithTelemetrySDK(), // telemetry.sdk.*
-		resource.WithHost(),         // host.name
-		resource.WithAttributes(attrs...),
+		resource.WithTelemetrySDK(),       // telemetry.sdk.*
+		resource.WithHost(),               // host.name (OS hostname) — a fallback
+		resource.WithAttributes(attrs...), // service.version, nomad.node.id
+		resource.WithFromEnv(),            // OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES
 	)
 	if res == nil {
 		res = resource.Default()

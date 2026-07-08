@@ -286,7 +286,10 @@ per-signal endpoints and exporters (`OTEL_TRACES_EXPORTER`,
 `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` — set one to `none` to disable
 just that signal, or `console` to print it for debugging),
 `OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_SDK_DISABLED=true` to force everything
-off. In the bundled job, add the variables to the task's `env` block.
+off. In the bundled job, add the variables to the task's `env` block — which
+is also where you can pin `host.name`/`host.id` to the Nomad node via
+`OTEL_RESOURCE_ATTRIBUTES = "host.name=${node.unique.name},host.id=${node.unique.id}"`
+(operator-supplied resource attributes override the auto-detected host name).
 
 ## Behaviour notes
 
