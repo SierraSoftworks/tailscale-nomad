@@ -56,6 +56,20 @@ job "tailscale-connector" {
       env {
         # The connector only publishes services placed on its own node.
         CONNECTOR_NODE_ID = "${node.unique.id}"
+
+        # OpenTelemetry is off unless an exporter is configured. Point it at a
+        # collector to turn on traces, metrics, and logs (see "Observability"
+        # in the README); uncomment and adjust:
+        #
+        # OTEL_EXPORTER_OTLP_ENDPOINT = "http://otel-collector.service.consul:4318"
+        # OTEL_SERVICE_NAME           = "nomad-tailscale-connector"
+        #
+        # Identify the telemetry by its Nomad node rather than the exec
+        # sandbox's hostname. Nomad interpolates these at runtime, and the
+        # connector lets OTEL_RESOURCE_ATTRIBUTES override the auto-detected
+        # host.name:
+        #
+        # OTEL_RESOURCE_ATTRIBUTES = "host.name=${node.unique.name},host.id=${node.unique.id}"
       }
 
       # First-time tailnet enrolment. Store a tagged, reusable auth key once:

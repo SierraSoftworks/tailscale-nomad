@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +13,10 @@ import (
 	"time"
 
 	humane "github.com/sierrasoftworks/humane-errors-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // nomadClient is a minimal client for the handful of Nomad HTTP API endpoints
@@ -84,17 +87,60 @@ func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*h
 func (c *nomadClient) get(ctx context.Context, path string, query url.Values, v any) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	resp, err := c.do(ctx, path, query)
+
+	// A client span per API call, nested under the reconcile pass. The span
+	// name uses a templated route so the service-name path segment doesn't
+	// explode span cardinality.
+	route := nomadRoute(path)
+	ctx, span := tracer.Start(ctx, "GET "+route, trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("http.request.method", "GET"),
+			attribute.String("url.path", path),
+			attribute.String("http.route", route),
+			attribute.String("server.address", c.addr),
+		))
+	defer span.End()
+
+	started := time.Now()
+	err := func() error {
+		resp, err := c.do(ctx, path, query)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+			return humane.Wrap(err, "parsing the Nomad API response for GET "+path,
+				"The configured address may not be a Nomad agent's HTTP API; check the -nomad-addr flag and $NOMAD_ADDR.",
+			)
+		}
+		return nil
+	}()
+
+	mNomadRequestDuration.Record(ctx, time.Since(started).Seconds(), metric.WithAttributes(
+		attribute.String("http.route", route),
+		attribute.Bool("error", err != nil),
+	))
 	if err != nil {
-		return err
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request failed")
 	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-		return humane.Wrap(err, "parsing the Nomad API response for GET "+path,
-			"The configured address may not be a Nomad agent's HTTP API; check the -nomad-addr flag and $NOMAD_ADDR.",
-		)
+	return err
+}
+
+// nomadRoute maps a request path to a low-cardinality route template for use
+// as a span name and metric attribute.
+func nomadRoute(path string) string {
+	switch {
+	case path == "/v1/services":
+		return "/v1/services"
+	case strings.HasPrefix(path, "/v1/service/"):
+		return "/v1/service/:name"
+	case path == "/v1/agent/self":
+		return "/v1/agent/self"
+	default:
+		return path
 	}
-	return nil
 }
 
 // serviceListStub is one entry of GET /v1/services: a service name with the
@@ -178,7 +224,8 @@ func (c *nomadClient) watchEvents(ctx context.Context, notify chan<- struct{}) {
 		if lifetime > time.Minute {
 			backoff = time.Second
 		}
-		log.Printf("warn: event stream disconnected; reconnecting in %s: %s", backoff, display(classifyStreamErr(err, lifetime)))
+		logf(ctx, levelWarn, "event stream disconnected; reconnecting in %s: %s", backoff, display(classifyStreamErr(err, lifetime)))
+		mStreamReconnects.Add(ctx, 1)
 		select {
 		case <-ctx.Done():
 			return
@@ -215,6 +262,11 @@ func (c *nomadClient) streamEvents(ctx context.Context, poke func()) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	// The long-lived stream deliberately gets no span (it would run for the
+	// life of the process); it is tracked with an up/down gauge instead.
+	mStreamUp.Record(ctx, 1)
+	defer mStreamUp.Record(context.Background(), 0)
 
 	poke() // catch up on anything that changed while we were not connected
 

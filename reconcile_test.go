@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -65,18 +66,18 @@ func TestReconcileLifecycle(t *testing.T) {
 	web := ep("svc:web", "https", 443, "10.0.0.1:2000")
 
 	// New endpoint: published once, then steady-state is quiet.
-	r.reconcile([]desiredEndpoint{web})
+	r.reconcile(context.Background(), []desiredEndpoint{web})
 	if calls := pub.takeCalls(); len(calls) != 1 {
 		t.Fatalf("expected 1 publish, got %v", calls)
 	}
-	r.reconcile([]desiredEndpoint{web})
+	r.reconcile(context.Background(), []desiredEndpoint{web})
 	if calls := pub.takeCalls(); len(calls) != 0 {
 		t.Fatalf("expected steady state, got %v", calls)
 	}
 
 	// Backend moved (replacement alloc): repointed live, not re-published.
 	moved := ep("svc:web", "https", 443, "10.0.0.1:2001")
-	r.reconcile([]desiredEndpoint{moved})
+	r.reconcile(context.Background(), []desiredEndpoint{moved})
 	if calls := pub.takeCalls(); len(calls) != 0 {
 		t.Fatalf("expected no publish on backend move, got %v", calls)
 	}
@@ -86,7 +87,7 @@ func TestReconcileLifecycle(t *testing.T) {
 
 	// Deregistered with connections still in flight: drained immediately,
 	// not yet closed.
-	r.reconcile(nil)
+	r.reconcile(context.Background(), nil)
 	fe := pub.published[0]
 	if !fe.drained || fe.closed {
 		t.Fatalf("after dereg: drained=%v closed=%v, want drained, not closed", fe.drained, fe.closed)
@@ -94,14 +95,14 @@ func TestReconcileLifecycle(t *testing.T) {
 
 	// Within the grace window: still open.
 	*now = now.Add(10 * time.Second)
-	r.reconcile(nil)
+	r.reconcile(context.Background(), nil)
 	if fe.closed {
 		t.Fatal("closed before drain grace expired")
 	}
 
 	// Grace elapsed: force-closed.
 	*now = now.Add(30 * time.Second)
-	r.reconcile(nil)
+	r.reconcile(context.Background(), nil)
 	if !fe.closed {
 		t.Fatal("not closed after drain grace expired")
 	}
@@ -111,12 +112,12 @@ func TestReconcileIdleEndpointClosesEarly(t *testing.T) {
 	r, pub, _ := testReconciler(t)
 	web := ep("svc:web", "https", 443, "10.0.0.1:2000")
 
-	r.reconcile([]desiredEndpoint{web})
+	r.reconcile(context.Background(), []desiredEndpoint{web})
 	pub.published[0].idle = true
 
 	// No in-flight connections: drained and closed in the same pass, no
 	// need to sit out the grace period.
-	r.reconcile(nil)
+	r.reconcile(context.Background(), nil)
 	fe := pub.published[0]
 	if !fe.drained || !fe.closed {
 		t.Fatalf("idle endpoint: drained=%v closed=%v, want both", fe.drained, fe.closed)
@@ -127,8 +128,8 @@ func TestReconcileEndpointReturnsDuringGrace(t *testing.T) {
 	r, pub, now := testReconciler(t)
 	web := ep("svc:web", "https", 443, "10.0.0.1:2000")
 
-	r.reconcile([]desiredEndpoint{web})
-	r.reconcile(nil) // drained
+	r.reconcile(context.Background(), []desiredEndpoint{web})
+	r.reconcile(context.Background(), nil) // drained
 	old := pub.published[0]
 
 	// Redeployed before the grace expires: a fresh listener is published
@@ -136,13 +137,13 @@ func TestReconcileEndpointReturnsDuringGrace(t *testing.T) {
 	// schedule without affecting the new one.
 	*now = now.Add(5 * time.Second)
 	back := ep("svc:web", "https", 443, "10.0.0.1:2002")
-	r.reconcile([]desiredEndpoint{back})
+	r.reconcile(context.Background(), []desiredEndpoint{back})
 	if calls := pub.takeCalls(); len(calls) != 2 { // initial + re-publish
 		t.Fatalf("expected 2 publishes total, got %v", calls)
 	}
 
 	*now = now.Add(time.Hour)
-	r.reconcile([]desiredEndpoint{back})
+	r.reconcile(context.Background(), []desiredEndpoint{back})
 	fresh := pub.published[1]
 	if !old.closed {
 		t.Fatal("old endpoint not closed after grace")
@@ -157,8 +158,8 @@ func TestReconcilePathChangeRecreatesListener(t *testing.T) {
 	v1 := desiredEndpoint{Service: "svc:web", Proto: "https", Port: 443, Path: "/v1", Backend: "10.0.0.1:2000"}
 	v2 := desiredEndpoint{Service: "svc:web", Proto: "https", Port: 443, Path: "/v2", Backend: "10.0.0.1:2000"}
 
-	r.reconcile([]desiredEndpoint{v1})
-	r.reconcile([]desiredEndpoint{v2})
+	r.reconcile(context.Background(), []desiredEndpoint{v1})
+	r.reconcile(context.Background(), []desiredEndpoint{v2})
 
 	if len(pub.published) != 2 {
 		t.Fatalf("expected 2 published endpoints, got %d", len(pub.published))
@@ -173,17 +174,17 @@ func TestReconcilePublishErrorRetries(t *testing.T) {
 	web := ep("svc:web", "https", 443, "10.0.0.1:2000")
 
 	pub.fail[web.key()] = fmt.Errorf("not yet approved")
-	r.reconcile([]desiredEndpoint{web})
+	r.reconcile(context.Background(), []desiredEndpoint{web})
 	if len(pub.published) != 0 {
 		t.Fatal("endpoint published despite error")
 	}
 
 	delete(pub.fail, web.key())
-	r.reconcile([]desiredEndpoint{web})
+	r.reconcile(context.Background(), []desiredEndpoint{web})
 	if len(pub.published) != 1 {
 		t.Fatal("endpoint not retried after error cleared")
 	}
-	r.reconcile([]desiredEndpoint{web})
+	r.reconcile(context.Background(), []desiredEndpoint{web})
 	if calls := len(pub.calls); calls != 2 { // fail + successful retry; steady state adds none
 		t.Fatalf("expected 2 publish attempts total, got %d", calls)
 	}
@@ -191,7 +192,7 @@ func TestReconcilePublishErrorRetries(t *testing.T) {
 
 func TestShutdownWaitsForConnections(t *testing.T) {
 	r, pub, _ := testReconciler(t)
-	r.reconcile([]desiredEndpoint{
+	r.reconcile(context.Background(), []desiredEndpoint{
 		ep("svc:web", "https", 443, "10.0.0.1:2000"),
 		ep("svc:db", "tcp", 5432, "10.0.0.1:2001"),
 	})
@@ -199,7 +200,7 @@ func TestShutdownWaitsForConnections(t *testing.T) {
 	// One endpoint stays busy: shutdown drains both, closes the idle one
 	// quickly, and force-closes the busy one when the grace runs out.
 	pub.published[0].idle = true
-	r.shutdown(5 * time.Second)
+	r.shutdown(context.Background(), 5*time.Second)
 
 	for i, fe := range pub.published {
 		if !fe.drained || !fe.closed {
@@ -214,9 +215,9 @@ func TestNextDeadline(t *testing.T) {
 		t.Fatal("expected no deadline on a fresh reconciler")
 	}
 
-	r.reconcile([]desiredEndpoint{ep("svc:web", "https", 443, "10.0.0.1:2000")})
+	r.reconcile(context.Background(), []desiredEndpoint{ep("svc:web", "https", 443, "10.0.0.1:2000")})
 	_ = pub.takeCalls()
-	r.reconcile(nil)
+	r.reconcile(context.Background(), nil)
 
 	deadline, ok := r.nextDeadline()
 	if !ok {
