@@ -1,24 +1,24 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (e.g. 0.1.0)"
-        required: true
+  release:
+    types: [published]
 
 permissions:
   contents: write
 
-concurrency: release
+concurrency: release-${{ github.event.release.tag_name }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  release:
-    name: Build & publish
+  binaries:
+    name: Build & upload binaries
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ inputs.version }}
-      TAG: v${{ inputs.version }}
+      VERSION: ${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,14 +26,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Check release does not already exist
+      - name: Determine version
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "Release ${TAG} already exists." >&2
-            exit 1
-          fi
+          TAG: ${{ github.event.release.tag_name }}
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Test
         run: go vet ./... && go test ./...
@@ -50,16 +46,61 @@ jobs:
           done
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
 
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "nomad-tailscale-connector ${VERSION}" \
-            --notes "Publishes Nomad services as Tailscale Services. Deploy as a Nomad system job — see the [README](https://github.com/${GITHUB_REPOSITORY}#readme) for the full setup guide.
-
-          The \`linux_amd64\` build is for x86_64 nodes and \`linux_arm64\` for aarch64 nodes; the bundled job file selects the right one via \`\${attr.cpu.arch}\`." \
-            dist/nomad-tailscale-connector_${VERSION}_linux_amd64.tar.gz \
-            dist/nomad-tailscale-connector_${VERSION}_linux_arm64.tar.gz \
+      - name: Upload release artifacts
+        uses: SierraSoftworks/gh-releases@v1.0.10
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          overwrite: "true"
+          files: |
+            dist/nomad-tailscale-connector_${{ env.VERSION }}_linux_amd64.tar.gz
+            dist/nomad-tailscale-connector_${{ env.VERSION }}_linux_arm64.tar.gz
             dist/SHA256SUMS
+
+  docker:
+    name: Build & push container image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      # Go cross-compiles on the build host (see the Dockerfile), so a single
+      # multi-platform build stays fast and needs no QEMU emulation.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
