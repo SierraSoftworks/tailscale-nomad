@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -64,5 +65,49 @@ func TestClassifyStreamErr(t *testing.T) {
 	// Non-EOF failures (e.g. connection refused) keep their own story.
 	if got := display(classifyStreamErr(errors.New("connection reset"), time.Second)); strings.Contains(got, "hint:") {
 		t.Errorf("non-EOF error should stay bare:\n%s", got)
+	}
+}
+
+func TestLocalIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"config":{"Datacenter":"dc-west"},"stats":{"client":{"node_id":"node-1"}}}`)
+	}))
+	defer srv.Close()
+
+	node, dc, err := newNomadClient(srv.URL, "").localIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node != "node-1" || dc != "dc-west" {
+		t.Fatalf("identity = node %q, dc %q", node, dc)
+	}
+}
+
+func TestServiceEventWireFormat(t *testing.T) {
+	var batch serviceEventBatch
+	err := json.Unmarshal([]byte(`{
+		"Index":42,
+		"Events":[{
+			"Type":"ServiceRegistration",
+			"Key":"reg-1",
+			"Namespace":"default",
+			"Index":42,
+			"Payload":{"Service":{
+				"ID":"reg-1","ServiceName":"web","Namespace":"default",
+				"NodeID":"node-1","Datacenter":"dc-1","Address":"10.0.0.1",
+				"Port":8080,"CreateIndex":40,"ModifyIndex":42,
+				"Tags":["tailscale.enable=true"]
+			}}
+		}]
+	}`), &batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Index != 42 || len(batch.Events) != 1 {
+		t.Fatalf("batch = %+v", batch)
+	}
+	reg := batch.Events[0].Payload.Service
+	if reg.Datacenter != "dc-1" || reg.NodeID != "node-1" || reg.ModifyIndex != 42 {
+		t.Fatalf("registration = %+v", reg)
 	}
 }

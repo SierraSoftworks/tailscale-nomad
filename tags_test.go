@@ -23,6 +23,7 @@ func TestParseTagsDefaults(t *testing.T) {
 	}
 	want := &serviceSpec{
 		Service:   "svc:web",
+		Scope:     "datacenter",
 		Endpoints: []endpoint{{Proto: "https", Port: 443}},
 	}
 	if !reflect.DeepEqual(spec, want) {
@@ -43,6 +44,7 @@ func TestParseTagsFull(t *testing.T) {
 	}
 	want := &serviceSpec{
 		Service: "svc:frontend",
+		Scope:   "datacenter",
 		Endpoints: []endpoint{
 			{Proto: "https", Port: 443, Path: "/app"},
 			{Proto: "tcp", Port: 5432}, // path only applies to L7 endpoints
@@ -50,6 +52,36 @@ func TestParseTagsFull(t *testing.T) {
 	}
 	if !reflect.DeepEqual(spec, want) {
 		t.Fatalf("got %+v, want %+v", spec, want)
+	}
+}
+
+func TestParseTagsScope(t *testing.T) {
+	for _, scope := range []string{"node", "datacenter", "global"} {
+		t.Run(scope, func(t *testing.T) {
+			spec, warns := parseTags("tailscale", "web", []string{
+				"tailscale.enable=true",
+				"tailscale.scope=" + scope,
+			}, proxyConfig{})
+			if len(warns) != 0 {
+				t.Fatalf("unexpected warnings: %v", warns)
+			}
+			if spec.Scope != scope {
+				t.Fatalf("scope = %q, want %q", spec.Scope, scope)
+			}
+		})
+	}
+}
+
+func TestParseTagsInvalidScopeUsesDatacenter(t *testing.T) {
+	spec, warns := parseTags("tailscale", "web", []string{
+		"tailscale.enable=true",
+		"tailscale.scope=region",
+	}, proxyConfig{})
+	if len(warns) != 1 {
+		t.Fatalf("expected one warning, got %v", warns)
+	}
+	if spec.Scope != "datacenter" {
+		t.Fatalf("scope = %q, want datacenter", spec.Scope)
 	}
 }
 
