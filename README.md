@@ -47,10 +47,13 @@ Set `shutdown_delay` on the group (or service) to cover the drain window —
 immediately after deregistering and in-flight requests are cut regardless of
 what the connector does.
 
-Because each connector only manages services scheduled on **its own node**,
-running it on several nodes gives you Tailscale's native multi-host
-behaviour: each node advertises its local allocations and Tailscale routes
-across the available hosts, failing over when one drains.
+By default, each connector manages services registered in **its own
+datacenter**. Running it on several nodes gives Tailscale multiple Service
+hosts within each datacenter; use `tailscale.scope=node` for strict node-local
+backends or `tailscale.scope=global` for cross-datacenter backends. Which host a
+client uses is controlled separately by [Tailscale Service host
+selection](https://tailscale.com/docs/features/tailscale-services); see
+[Routing performance](#routing-performance).
 
 ## Prerequisites
 
@@ -219,6 +222,7 @@ group "app" {
 |-----|---------|
 | `tailscale.enable=true` | Opt this service in (required). |
 | `tailscale.service=<name>` | Tailscale Service to advertise for (default: the Nomad service name; `svc:` prefix optional). |
+| `tailscale.scope=<scope>` | Advertisement scope: `node`, `datacenter` (default), or `global`. Loopback registrations are always node-scoped. |
 | `tailscale.https=<port>` | HTTPS endpoint on tailnet port `<port>`; tsnet terminates TLS. **Default when no protocol tag is given: `https=443`.** |
 | `tailscale.http=<port>` | Plain-HTTP endpoint. |
 | `tailscale.tcp=<port>` | TCP passthrough endpoint. |
@@ -246,14 +250,81 @@ a warning and retain the connector defaults. Changing one of these tags drains
 and recreates the affected endpoint so the new settings apply to all new
 connections.
 
+### Advertisement scope
+
+The default `tailscale.scope=datacenter` causes each connector to advertise
+only services with an eligible registration in its own Nomad datacenter. It
+prevents a connector from proxying onward to another Nomad datacenter, but does
+not by itself guarantee that Tailscale selects a Service host in the client's
+datacenter.
+
+Use `tailscale.scope=node` to advertise only from the connector running on the
+allocation's own node. Loopback registrations (`127.0.0.0/8` or `::1`) are
+always treated as node-scoped, even if they request a broader scope, because
+another node cannot reach that backend.
+
+Use `tailscale.scope=global` to let any connector in the current Nomad region
+advertise the service and proxy to an eligible registration in any datacenter.
+This can increase failover coverage at the cost of inter-datacenter latency and
+traffic. For every scope, a connector prefers a backend on its own node, then
+one in its datacenter, then (for `global`) one in another datacenter; the newest
+registration breaks ties within the same locality.
+
+### Routing performance
+
+There are two independent routing decisions:
+
+1. Tailscale selects one of the devices advertising the Service's TailVIP.
+2. This connector selects an eligible Nomad registration according to
+   `tailscale.scope` and proxies the connection to it.
+
+According to the [Tailscale high-availability
+guidance](https://tailscale.com/docs/how-to/set-up-high-availability#failover),
+the default behavior for overlapping Service hosts is primary/failover: all
+clients use the oldest advertising host, then fail over in oldest-first order.
+It does not select the nearest Nomad datacenter or distribute clients across
+hosts. Consequently:
+
+- `node` guarantees a node-local connector-to-backend hop, but clients may
+  still reach that node from another datacenter.
+- `datacenter` guarantees the connector-to-backend hop stays within the
+  selected host's Nomad datacenter. Without Regional Routing, the oldest host
+  may still be the ingress for clients in every datacenter.
+- `global` allows both the client-to-connector and connector-to-backend paths
+  to cross datacenter boundaries. A nearby connector can select a distant
+  backend, so this mode prioritizes reachability over locality.
+
+For geographically distributed traffic, enable [Tailscale Regional
+Routing](https://tailscale.com/docs/how-to/set-up-high-availability#regional-routing)
+(Premium and Enterprise). Clients are assigned to the closest available DERP
+regional group. Within that group, the default in-region behavior gives each
+client a stable pseudorandom host preference, providing best-effort load
+distribution and stickiness rather than per-connection round robin. If a host
+or entire region becomes unavailable, another preference or region is used.
+
+Tailscale DERP regions are independent of Nomad datacenter names. For the
+lowest latency, place connector nodes and service registrations so each Nomad
+datacenter maps cleanly to the expected DERP region, use the default
+`datacenter` scope, and enable Regional Routing. Tailscale selects the Service
+host, not the backend behind it; this connector's scope prevents an accidental
+long second hop after that selection.
+
+See the official [Tailscale Services
+guide](https://tailscale.com/docs/features/tailscale-services), including its
+note that Regional Routing must be enabled to use in-region load balancing with
+Services. Existing TCP connections are not migrated between hosts after an
+abrupt failure; graceful draining stops new connections while allowing current
+ones to finish.
+
 ## Connector flags
 
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `-nomad-addr` | `$NOMAD_ADDR`, else the task API socket, else `http://127.0.0.1:4646` | Nomad API address (`unix://` supported). |
 | `-node-id` | `$CONNECTOR_NODE_ID`, else auto-detected | Node whose services are published. |
+| `-datacenter` | `$NOMAD_DC`, else auto-detected | Datacenter used for datacenter-scoped services. |
 | `-tag-prefix` | `tailscale` | Tag prefix to react to. |
-| `-interval` | `30s` | Full reconcile interval (the event stream triggers reconciles sooner). |
+| `-interval` | `5m` | Authoritative full repair interval; service events update cached state immediately. |
 | `-drain-grace` | `30s` | How long in-flight connections of a withdrawn endpoint get to finish. |
 | `-shutdown-grace` | `20s` | Same, for connector shutdown; keep below the task's `kill_timeout`. |
 | `-max-connections` | `256` | Maximum simultaneous client connections per published endpoint; `0` disables the limit. |
@@ -303,6 +374,12 @@ OTEL_SERVICE_NAME=nomad-tailscale-connector   # optional; this is the default
   API call under it) and publishing endpoints are child spans. There is no
   process-lifetime root span; the long-lived event stream deliberately gets
   none.
+
+Service registration events are applied to an in-memory cache, so normal
+deployments reconcile without re-fetching the complete service catalog. The
+connector performs an authoritative full API repair at startup, after event
+stream reconnects or malformed events, and every `-interval` to recover from a
+truncated Nomad event backlog.
 - **Metrics** cover reconcile passes and duration, active/draining endpoint
   gauges, publish/withdraw/backend-move counts, publish failures, Nomad API
   request duration, and event-stream connectivity (`connector.*`).
@@ -393,8 +470,8 @@ nomad action -job tailscale-connector -group connector -task connector dry-run
 - **A node rejoined as a new device** — its tsnet state was lost; make sure
   the state host volume exists and is mounted (`-ts-dir=/data/tsnet`).
 - **Nothing happens on service changes** — the event stream may be unable to
-  connect (check connector logs); the periodic reconcile still applies
-  changes within `-interval`.
+  connect (check connector logs); its reconnect and the periodic authoritative
+  repair restore cached state.
 
 ## Building
 

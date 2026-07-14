@@ -168,12 +168,30 @@ type serviceRegistration struct {
 	ServiceName string
 	Namespace   string
 	NodeID      string
+	Datacenter  string
 	JobID       string
 	AllocID     string
 	Tags        []string
 	Address     string
 	Port        int
 	CreateIndex uint64
+	ModifyIndex uint64
+}
+
+type serviceEvent struct {
+	Type      string
+	Key       string
+	Namespace string
+	Index     uint64
+	Payload   struct {
+		Service serviceRegistration
+	}
+}
+
+type serviceEventBatch struct {
+	Index  uint64
+	Events []serviceEvent
+	Repair bool
 }
 
 func (c *nomadClient) getService(ctx context.Context, namespace, name string) ([]serviceRegistration, error) {
@@ -182,41 +200,33 @@ func (c *nomadClient) getService(ctx context.Context, namespace, name string) ([
 	return out, err
 }
 
-// localNodeID asks the local agent which client node it is. Used as a
-// fallback when the node ID is not provided via flag or environment.
-func (c *nomadClient) localNodeID(ctx context.Context) (string, error) {
+func (c *nomadClient) localIdentity(ctx context.Context) (string, string, error) {
 	var self struct {
-		Stats map[string]map[string]string `json:"stats"`
+		Stats  map[string]map[string]string `json:"stats"`
+		Config struct {
+			Datacenter string
+		} `json:"config"`
 	}
 	if err := c.get(ctx, "/v1/agent/self", nil, &self); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if id := self.Stats["client"]["node_id"]; id != "" {
-		return id, nil
+		return id, self.Config.Datacenter, nil
 	}
-	return "", humane.New("the Nomad agent reports no client node ID",
+	return "", "", humane.New("the Nomad agent reports no client node ID",
 		"Point the connector at an agent running in client mode, or skip auto-detection by setting -node-id or $CONNECTOR_NODE_ID (the bundled job does this).",
 	)
 }
 
-// watchEvents follows Nomad's event stream for Service topic events and pokes
-// the notify channel whenever service registrations change. Events are used
-// purely as a reconcile trigger — their payload is never parsed — which keeps
-// the connector robust against payload schema changes. Reconnects use
-// exponential backoff, and each (re)connect sends a notification to cover
-// anything missed while disconnected.
-func (c *nomadClient) watchEvents(ctx context.Context, notify chan<- struct{}) {
-	poke := func() {
-		select {
-		case notify <- struct{}{}:
-		default:
-		}
-	}
-
+// watchEvents follows Nomad's event stream for Service topic events and sends
+// registration changes to the reconciliation cache. Reconnects use
+// exponential backoff and request an authoritative repair because Nomad's
+// in-memory event backlog is bounded.
+func (c *nomadClient) watchEvents(ctx context.Context, updates chan<- serviceEventBatch) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		started := time.Now()
-		err := c.streamEvents(ctx, poke)
+		err := c.streamEvents(ctx, updates)
 		if ctx.Err() != nil {
 			return
 		}
@@ -226,6 +236,11 @@ func (c *nomadClient) watchEvents(ctx context.Context, notify chan<- struct{}) {
 		}
 		logf(ctx, levelWarn, "event stream disconnected; reconnecting in %s: %s", backoff, display(classifyStreamErr(err, lifetime)))
 		mStreamReconnects.Add(ctx, 1)
+		select {
+		case updates <- serviceEventBatch{Repair: true}:
+		case <-ctx.Done():
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -252,7 +267,7 @@ func classifyStreamErr(err error, lifetime time.Duration) error {
 	return err
 }
 
-func (c *nomadClient) streamEvents(ctx context.Context, poke func()) error {
+func (c *nomadClient) streamEvents(ctx context.Context, updates chan<- serviceEventBatch) error {
 	query := url.Values{
 		"topic":     {"Service"},
 		"namespace": {"*"},
@@ -268,18 +283,19 @@ func (c *nomadClient) streamEvents(ctx context.Context, poke func()) error {
 	mStreamUp.Record(ctx, 1)
 	defer mStreamUp.Record(context.Background(), 0)
 
-	poke() // catch up on anything that changed while we were not connected
-
 	dec := json.NewDecoder(resp.Body)
 	for {
-		var frame struct {
-			Events []json.RawMessage
-		}
+		var frame serviceEventBatch
 		if err := dec.Decode(&frame); err != nil {
 			return err
 		}
-		if len(frame.Events) > 0 { // empty frames are heartbeats
-			poke()
+		if len(frame.Events) == 0 { // empty frames are heartbeats
+			continue
+		}
+		select {
+		case updates <- frame:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }

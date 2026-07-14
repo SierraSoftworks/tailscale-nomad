@@ -4,9 +4,9 @@
 // The connector joins the tailnet as its own (userspace, tsnet-based) node
 // and hosts Services directly via tsnet's ListenService: it watches the
 // local Nomad agent for service registrations carrying Traefik-style
-// `tailscale.*` tags, advertises a Service endpoint for each one scheduled
-// on its node, and proxies the Service's traffic to the allocation's
-// address and port. When a service goes away its advertisement is withdrawn
+// `tailscale.*` tags, advertises eligible Service endpoints according to their
+// node/datacenter/global scope, and proxies traffic to a selected allocation.
+// When a service goes away its advertisement is withdrawn
 // immediately while in-flight connections — kept alive by the task through
 // Nomad's shutdown_delay — get a grace period to finish.
 //
@@ -53,8 +53,9 @@ func run() int {
 	var (
 		nomadAddr      = flag.String("nomad-addr", "", "Nomad API address (default: $NOMAD_ADDR, else the task API socket, else http://127.0.0.1:4646)")
 		nodeID         = flag.String("node-id", "", "Nomad node ID whose services are published (default: $CONNECTOR_NODE_ID, else auto-detected from the local agent)")
+		datacenter     = flag.String("datacenter", "", "Nomad datacenter used for datacenter-scoped services (default: $NOMAD_DC, else auto-detected from the local agent)")
 		tagPrefix      = flag.String("tag-prefix", "tailscale", "service tag prefix to react to")
-		interval       = flag.Duration("interval", 30*time.Second, "full reconcile interval")
+		interval       = flag.Duration("interval", 5*time.Minute, "authoritative full reconcile interval")
 		drainGrace     = flag.Duration("drain-grace", 30*time.Second, "how long in-flight connections of a withdrawn endpoint get to finish before being closed")
 		shutdownGrace  = flag.Duration("shutdown-grace", 20*time.Second, "how long in-flight connections get to finish on shutdown; keep below the task's kill_timeout")
 		maxConnections = flag.Int("max-connections", 256, "maximum simultaneous client connections per published endpoint (0 disables the limit)")
@@ -86,13 +87,26 @@ func run() int {
 	if node == "" {
 		node = os.Getenv("CONNECTOR_NODE_ID")
 	}
-	if node == "" {
-		var err error
-		node, err = nomad.localNodeID(ctx)
+	dc := *datacenter
+	if dc == "" {
+		dc = os.Getenv("NOMAD_DC")
+	}
+	if node == "" || dc == "" {
+		detectedNode, detectedDC, err := nomad.localIdentity(ctx)
 		if err != nil {
-			logf(ctx, levelError, "determining local node ID: %s", display(err))
+			logf(ctx, levelError, "determining local Nomad identity: %s", display(err))
 			return 1
 		}
+		if node == "" {
+			node = detectedNode
+		}
+		if dc == "" {
+			dc = detectedDC
+		}
+	}
+	if dc == "" {
+		logf(ctx, levelError, "the Nomad agent reports no datacenter; set -datacenter or $NOMAD_DC")
+		return 1
 	}
 
 	// From here on, spans, metrics, and (a bridge to) logs flow to whatever
@@ -110,8 +124,8 @@ func run() int {
 		}
 	}()
 
-	logf(ctx, levelInfo, "nomad-tailscale-connector %s: nomad=%s node=%s tag-prefix=%s drain-grace=%s dry-run=%v",
-		version, addr, node, *tagPrefix, *drainGrace, *dryRun)
+	logf(ctx, levelInfo, "nomad-tailscale-connector %s: nomad=%s node=%s datacenter=%s tag-prefix=%s drain-grace=%s dry-run=%v",
+		version, addr, node, dc, *tagPrefix, *drainGrace, *dryRun)
 
 	var pub publisher = dryRunPublisher{}
 	if !*dryRun {
@@ -155,13 +169,17 @@ func run() int {
 	}
 
 	rec := newReconciler(pub, *drainGrace)
+	proxyDefaults := defaultProxyConfig(*maxConnections)
+	state := serviceState{}
+	events := make(chan serviceEventBatch, 256)
+	go nomad.watchEvents(ctx, events)
 
 	// pass runs one reconcile as a short-lived, self-contained trace rooted
 	// here: gathering Nomad's services and converging the published endpoints
 	// become child spans of this one. trigger records what woke the pass
 	// (startup, an event-stream notification, the periodic interval, or a
 	// draining deadline) so traces and metrics can be sliced by cause.
-	pass := func(ctx context.Context, trigger string) {
+	pass := func(ctx context.Context, trigger string, repair bool, replay []serviceEventBatch) {
 		ctx, span := tracer.Start(ctx, "reconcile", trace.WithAttributes(
 			attribute.String("connector.trigger", trigger),
 			attribute.String("nomad.node.id", node),
@@ -170,7 +188,43 @@ func run() int {
 
 		started := time.Now()
 		outcome := "success"
-		desired, err := gather(ctx, nomad, node, *tagPrefix, defaultProxyConfig(*maxConnections))
+		var err error
+		if repair {
+			var repaired serviceState
+			repaired, err = gatherState(ctx, nomad, *tagPrefix)
+			if err == nil {
+				repairAgain := false
+				for _, batch := range replay {
+					if !repaired.apply(batch, *tagPrefix) {
+						repairAgain = true
+					}
+				}
+				// Replay events received while the multi-request snapshot was
+				// being built so the installed state is not already stale.
+			drain:
+				for {
+					select {
+					case batch := <-events:
+						if batch.Repair || !repaired.apply(batch, *tagPrefix) {
+							repairAgain = true
+						}
+					default:
+						break drain
+					}
+				}
+				state = repaired
+				if repairAgain {
+					select {
+					case events <- serviceEventBatch{Repair: true}:
+					default:
+					}
+				}
+			}
+		}
+		var desired []desiredEndpoint
+		if err == nil {
+			desired = desiredFromState(ctx, state, node, dc, *tagPrefix, proxyDefaults)
+		}
 		if err != nil {
 			outcome = "error"
 			span.RecordError(err)
@@ -195,26 +249,22 @@ func run() int {
 	if *once {
 		startTrigger = "once"
 	}
-	pass(ctx, startTrigger)
+	pass(ctx, startTrigger, true, nil)
 	if *once {
 		rec.shutdown(ctx, *shutdownGrace)
 		return 0
 	}
 
-	events := make(chan struct{}, 1)
-	go nomad.watchEvents(ctx, events)
-
+	repairTimer := time.NewTimer(*interval)
+	defer repairTimer.Stop()
 	for {
-		trigger := "interval"
-		wait := *interval
+		var deadlineTimer <-chan time.Time
 		if deadline, ok := rec.nextDeadline(); ok {
-			if until := time.Until(deadline); until < wait {
-				wait = until
-				trigger = "deadline"
+			until := time.Until(deadline)
+			if until < 250*time.Millisecond {
+				until = 250 * time.Millisecond
 			}
-		}
-		if wait < 250*time.Millisecond {
-			wait = 250 * time.Millisecond
+			deadlineTimer = time.After(until)
 		}
 
 		select {
@@ -226,17 +276,47 @@ func run() int {
 			logf(context.Background(), levelInfo, "shutting down: draining %d endpoint(s)", len(rec.active))
 			rec.shutdown(context.Background(), *shutdownGrace)
 			return 0
-		case <-events:
-			trigger = "event"
-			// Debounce bursts (e.g. a deployment replacing several allocs).
-			select {
-			case <-ctx.Done():
-			case <-time.After(500 * time.Millisecond):
+		case batch := <-events:
+			repair := batch.Repair
+			var replay []serviceEventBatch
+			if !repair {
+				replay = append(replay, batch)
+				repair = !state.apply(batch, *tagPrefix)
 			}
-		case <-time.After(wait):
+			// Debounce bursts (e.g. a deployment replacing several allocs).
+			timer := time.NewTimer(500 * time.Millisecond)
+		debounce:
+			for {
+				select {
+				case <-ctx.Done():
+					break debounce
+				case next := <-events:
+					if next.Repair {
+						repair = true
+					} else {
+						replay = append(replay, next)
+						if !state.apply(next, *tagPrefix) {
+							repair = true
+						}
+					}
+				case <-timer.C:
+					break debounce
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			pass(ctx, "event", repair, replay)
+			continue
+		case <-deadlineTimer:
+			pass(ctx, "deadline", false, nil)
+		case <-repairTimer.C:
+			pass(ctx, "interval", true, nil)
+			repairTimer.Reset(*interval)
 		}
-
-		pass(ctx, trigger)
 	}
 }
 
@@ -259,18 +339,61 @@ func resolveNomadAddr(flagVal string) string {
 	return "http://127.0.0.1:4646"
 }
 
-// gather queries Nomad for native services carrying the enable tag and turns
-// the registrations placed on this node into the desired set of endpoints. It
-// runs as a child span of the reconcile pass, with the underlying Nomad API
-// calls nested beneath it.
-func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string, proxyDefaults proxyConfig) (desired []desiredEndpoint, err error) {
+type serviceState map[string]serviceRegistration
+
+func registrationKey(namespace, id string) string { return namespace + "\x00" + id }
+
+func (s serviceState) apply(batch serviceEventBatch, tagPrefix string) bool {
+	for _, event := range batch.Events {
+		reg := event.Payload.Service
+		namespace := event.Namespace
+		if namespace == "" {
+			namespace = reg.Namespace
+		}
+		id := event.Key
+		if id == "" {
+			id = reg.ID
+		}
+		key := registrationKey(namespace, id)
+		if namespace == "" || id == "" {
+			return false
+		}
+		switch event.Type {
+		case "ServiceRegistration":
+			if reg.ServiceName == "" {
+				return false
+			}
+			reg.ID = id
+			reg.Namespace = namespace
+			if !hasEnableTag(reg.Tags, tagPrefix) {
+				delete(s, key)
+				continue
+			}
+			if current, ok := s[key]; !ok || reg.ModifyIndex >= current.ModifyIndex {
+				s[key] = reg
+			}
+		case "ServiceDeregistration":
+			if current, ok := s[key]; ok && current.ModifyIndex <= event.Index {
+				delete(s, key)
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// gatherState builds an authoritative registration snapshot. Event-driven
+// reconciles update this snapshot in memory; periodic passes repair anything
+// missed while the event stream was disconnected.
+func gatherState(ctx context.Context, nomad *nomadClient, tagPrefix string) (state serviceState, err error) {
 	ctx, span := tracer.Start(ctx, "gather")
 	defer func() {
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "gather failed")
 		} else {
-			span.SetAttributes(attribute.Int("connector.endpoints.desired", len(desired)))
+			span.SetAttributes(attribute.Int("connector.registrations", len(state)))
 		}
 		span.End()
 	}()
@@ -280,8 +403,7 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string, p
 		return nil, err
 	}
 
-	claimed := map[string]string{} // "svc:<name>/<port>" -> nomad service that claimed it
-
+	state = serviceState{}
 	for _, ns := range namespaces {
 		for _, stub := range ns.Services {
 			if !hasEnableTag(stub.Tags, tagPrefix) {
@@ -292,68 +414,115 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string, p
 				return nil, fmt.Errorf("reading service %s/%s: %w", ns.Namespace, stub.ServiceName, err)
 			}
 
-			local := regs[:0]
 			for _, reg := range regs {
-				if reg.NodeID == nodeID {
-					local = append(local, reg)
-				}
+				state[registrationKey(reg.Namespace, reg.ID)] = reg
 			}
-			if len(local) == 0 {
+		}
+	}
+	return state, nil
+}
+
+// desiredFromState selects one reachable registration for each service and
+// translates its tags into published endpoints.
+func desiredFromState(ctx context.Context, state serviceState, nodeID, datacenter, tagPrefix string, proxyDefaults proxyConfig) []desiredEndpoint {
+	groups := map[string][]serviceRegistration{}
+	for _, reg := range state {
+		groups[reg.Namespace+"\x00"+reg.ServiceName] = append(groups[reg.Namespace+"\x00"+reg.ServiceName], reg)
+	}
+
+	var desired []desiredEndpoint
+	claimed := map[string]string{}
+	groupKeys := make([]string, 0, len(groups))
+	for key := range groups {
+		groupKeys = append(groupKeys, key)
+	}
+	sort.Strings(groupKeys)
+	for _, groupKey := range groupKeys {
+		regs := groups[groupKey]
+		sort.Slice(regs, func(i, j int) bool {
+			if regs[i].CreateIndex != regs[j].CreateIndex {
+				return regs[i].CreateIndex > regs[j].CreateIndex
+			}
+			return regs[i].ID < regs[j].ID
+		})
+		spec, warns := parseTags(tagPrefix, regs[0].ServiceName, regs[0].Tags, proxyDefaults)
+		for _, w := range warns {
+			logf(ctx, levelWarn, "service %s/%s: %s", regs[0].Namespace, regs[0].ServiceName, w)
+		}
+		if spec == nil {
+			continue
+		}
+
+		var reg serviceRegistration
+		bestRank := 3
+		for _, candidate := range regs {
+			rank, ok := registrationScopeRank(candidate, spec.Scope, nodeID, datacenter)
+			if !ok || rank > bestRank {
 				continue
 			}
+			if reg.ID == "" || rank < bestRank || candidate.CreateIndex > reg.CreateIndex ||
+				(candidate.CreateIndex == reg.CreateIndex && candidate.ID < reg.ID) {
+				reg, bestRank = candidate, rank
+			}
+		}
+		if reg.ID == "" {
+			continue
+		}
+		if reg.Address == "" || reg.Port == 0 {
+			logf(ctx, levelWarn, "%s", display(humane.New(
+				fmt.Sprintf("service %s/%s is registered without a usable address/port; not published", reg.Namespace, reg.ServiceName),
+				`Set port = "<label>" on the service block, with that label defined in the group's network block.`,
+				`Docker tasks with a custom network_mode register the container IP with port 0; add address_mode = "host" to the service block so the host-published address is registered instead.`,
+				"Inspect what Nomad registered with: nomad service info "+reg.ServiceName,
+			)))
+			continue
+		}
 
-			// Each endpoint proxies to a single backend, so with multiple
-			// local allocations we pick the newest.
-			sort.Slice(local, func(i, j int) bool { return local[i].CreateIndex > local[j].CreateIndex })
-			reg := local[0]
-			if len(local) > 1 {
-				logf(ctx, levelWarn, "service %s/%s has %d allocations on this node; only alloc %s is published",
-					ns.Namespace, stub.ServiceName, len(local), reg.AllocID)
+		backend := net.JoinHostPort(reg.Address, strconv.Itoa(reg.Port))
+		qualified := reg.Namespace + "/" + reg.ServiceName
+		for _, ep := range spec.Endpoints {
+			want := desiredEndpoint{
+				Service: spec.Service,
+				Proto:   ep.Proto,
+				Port:    ep.Port,
+				Path:    ep.Path,
+				Backend: backend,
+				Proxy:   ep.Proxy,
 			}
-
-			spec, warns := parseTags(tagPrefix, stub.ServiceName, reg.Tags, proxyDefaults)
-			for _, w := range warns {
-				logf(ctx, levelWarn, "service %s/%s: %s", ns.Namespace, stub.ServiceName, w)
-			}
-			if spec == nil {
-				continue
-			}
-			if reg.Address == "" || reg.Port == 0 {
+			// Only one listener can exist per Service port on this host.
+			portKey := fmt.Sprintf("%s/%d", want.Service, want.Port)
+			if prev, dup := claimed[portKey]; dup {
 				logf(ctx, levelWarn, "%s", display(humane.New(
-					fmt.Sprintf("service %s/%s is registered without a usable address/port; not published", ns.Namespace, stub.ServiceName),
-					`Set port = "<label>" on the service block, with that label defined in the group's network block.`,
-					`Docker tasks with a custom network_mode register the container IP with port 0; add address_mode = "host" to the service block so the host-published address is registered instead.`,
-					"Inspect what Nomad registered with: nomad service info "+stub.ServiceName,
+					fmt.Sprintf("service %s: %s port %d already claimed by %s; ignoring", qualified, want.Service, want.Port, prev),
+					"Only one backend can serve a given Service port on a node; give one of the services a different tailscale.service name or a different port.",
 				)))
 				continue
 			}
-
-			backend := net.JoinHostPort(reg.Address, strconv.Itoa(reg.Port))
-			qualified := ns.Namespace + "/" + stub.ServiceName
-			for _, ep := range spec.Endpoints {
-				want := desiredEndpoint{
-					Service: spec.Service,
-					Proto:   ep.Proto,
-					Port:    ep.Port,
-					Path:    ep.Path,
-					Backend: backend,
-					Proxy:   ep.Proxy,
-				}
-				// Only one listener can exist per Service port on this host.
-				portKey := fmt.Sprintf("%s/%d", want.Service, want.Port)
-				if prev, dup := claimed[portKey]; dup {
-					logf(ctx, levelWarn, "%s", display(humane.New(
-						fmt.Sprintf("service %s: %s port %d already claimed by %s; ignoring", qualified, want.Service, want.Port, prev),
-						"Only one backend can serve a given Service port on a node; give one of the services a different tailscale.service name or a different port.",
-					)))
-					continue
-				}
-				claimed[portKey] = qualified
-				desired = append(desired, want)
-			}
+			claimed[portKey] = qualified
+			desired = append(desired, want)
 		}
 	}
 
 	sort.Slice(desired, func(i, j int) bool { return desired[i].key() < desired[j].key() })
-	return desired, nil
+	return desired
+}
+
+func registrationScopeRank(reg serviceRegistration, scope, nodeID, datacenter string) (int, bool) {
+	if ip := net.ParseIP(reg.Address); ip != nil && ip.IsLoopback() {
+		return 0, reg.NodeID == nodeID
+	}
+	if reg.NodeID == nodeID {
+		return 0, true
+	}
+	switch scope {
+	case "node":
+		return 0, false
+	case "global":
+		if reg.Datacenter == datacenter {
+			return 1, true
+		}
+		return 2, true
+	default:
+		return 1, reg.Datacenter == datacenter
+	}
 }
