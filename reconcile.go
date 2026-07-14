@@ -19,12 +19,22 @@ type desiredEndpoint struct {
 	Port    int    // tailnet-facing port
 	Path    string // mount path for http/https handlers ("" = root)
 	Backend string // host:port on this machine
+	Proxy   proxyConfig
 }
 
 // key identifies the listener an endpoint needs. Backend is deliberately
 // excluded: a moved backend is repointed live rather than re-published.
 func (e desiredEndpoint) key() string {
-	return fmt.Sprintf("%s|%s|%d|%s", e.Service, e.Proto, e.Port, e.Path)
+	return fmt.Sprintf("%s|%s|%d|%s|%d|%s|%s|%s|%s|%s|%s",
+		e.Service, e.Proto, e.Port, e.Path,
+		e.Proxy.MaxConnections,
+		e.Proxy.ReadHeaderTimeout,
+		e.Proxy.IdleTimeout,
+		e.Proxy.BackendDialTimeout,
+		e.Proxy.BackendResponseHeaderTimeout,
+		e.Proxy.BackendIdleConnectionTimeout,
+		e.Proxy.ExpectContinueTimeout,
+	)
 }
 
 func (e desiredEndpoint) String() string {

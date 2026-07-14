@@ -51,20 +51,25 @@ func run() int {
 	installLogger(nil)
 
 	var (
-		nomadAddr     = flag.String("nomad-addr", "", "Nomad API address (default: $NOMAD_ADDR, else the task API socket, else http://127.0.0.1:4646)")
-		nodeID        = flag.String("node-id", "", "Nomad node ID whose services are published (default: $CONNECTOR_NODE_ID, else auto-detected from the local agent)")
-		tagPrefix     = flag.String("tag-prefix", "tailscale", "service tag prefix to react to")
-		interval      = flag.Duration("interval", 30*time.Second, "full reconcile interval")
-		drainGrace    = flag.Duration("drain-grace", 30*time.Second, "how long in-flight connections of a withdrawn endpoint get to finish before being closed")
-		shutdownGrace = flag.Duration("shutdown-grace", 20*time.Second, "how long in-flight connections get to finish on shutdown; keep below the task's kill_timeout")
-		tsDir         = flag.String("ts-dir", "", "tsnet state directory; must persist across restarts or the connector re-joins the tailnet as a new device (default: an os-specific user config dir)")
-		tsHostname    = flag.String("ts-hostname", "nomad-tailscale-connector", "hostname for the connector's tailnet device")
-		tsTags        = flag.String("ts-tags", "", "comma-separated ACL tags to advertise (Service hosts must be tagged; usually already conferred by a tagged auth key)")
-		dryRun        = flag.Bool("dry-run", false, "log what would be published without joining the tailnet or proxying traffic")
-		once          = flag.Bool("once", false, "run a single reconcile pass, then drain and exit")
-		showVersion   = flag.Bool("version", false, "print the connector version and exit")
+		nomadAddr      = flag.String("nomad-addr", "", "Nomad API address (default: $NOMAD_ADDR, else the task API socket, else http://127.0.0.1:4646)")
+		nodeID         = flag.String("node-id", "", "Nomad node ID whose services are published (default: $CONNECTOR_NODE_ID, else auto-detected from the local agent)")
+		tagPrefix      = flag.String("tag-prefix", "tailscale", "service tag prefix to react to")
+		interval       = flag.Duration("interval", 30*time.Second, "full reconcile interval")
+		drainGrace     = flag.Duration("drain-grace", 30*time.Second, "how long in-flight connections of a withdrawn endpoint get to finish before being closed")
+		shutdownGrace  = flag.Duration("shutdown-grace", 20*time.Second, "how long in-flight connections get to finish on shutdown; keep below the task's kill_timeout")
+		maxConnections = flag.Int("max-connections", 256, "maximum simultaneous client connections per published endpoint (0 disables the limit)")
+		tsDir          = flag.String("ts-dir", "", "tsnet state directory; must persist across restarts or the connector re-joins the tailnet as a new device (default: an os-specific user config dir)")
+		tsHostname     = flag.String("ts-hostname", "nomad-tailscale-connector", "hostname for the connector's tailnet device")
+		tsTags         = flag.String("ts-tags", "", "comma-separated ACL tags to advertise (Service hosts must be tagged; usually already conferred by a tagged auth key)")
+		dryRun         = flag.Bool("dry-run", false, "log what would be published without joining the tailnet or proxying traffic")
+		once           = flag.Bool("once", false, "run a single reconcile pass, then drain and exit")
+		showVersion    = flag.Bool("version", false, "print the connector version and exit")
 	)
 	flag.Parse()
+	if *maxConnections < 0 {
+		logf(context.Background(), levelError, "-max-connections must be zero or greater")
+		return 2
+	}
 
 	if *showVersion {
 		fmt.Println(version)
@@ -165,12 +170,13 @@ func run() int {
 
 		started := time.Now()
 		outcome := "success"
-		desired, err := gather(ctx, nomad, node, *tagPrefix)
+		desired, err := gather(ctx, nomad, node, *tagPrefix, defaultProxyConfig(*maxConnections))
 		if err != nil {
 			outcome = "error"
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "gather failed")
 			logf(ctx, levelWarn, "skipping reconcile, could not list Nomad services: %s", display(err))
+			rec.sweepDraining(ctx, false)
 		} else {
 			span.SetAttributes(attribute.Int("connector.endpoints.desired", len(desired)))
 			rec.reconcile(ctx, desired)
@@ -257,7 +263,7 @@ func resolveNomadAddr(flagVal string) string {
 // the registrations placed on this node into the desired set of endpoints. It
 // runs as a child span of the reconcile pass, with the underlying Nomad API
 // calls nested beneath it.
-func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (desired []desiredEndpoint, err error) {
+func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string, proxyDefaults proxyConfig) (desired []desiredEndpoint, err error) {
 	ctx, span := tracer.Start(ctx, "gather")
 	defer func() {
 		if err != nil {
@@ -305,7 +311,7 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (
 					ns.Namespace, stub.ServiceName, len(local), reg.AllocID)
 			}
 
-			spec, warns := parseTags(tagPrefix, stub.ServiceName, reg.Tags)
+			spec, warns := parseTags(tagPrefix, stub.ServiceName, reg.Tags, proxyDefaults)
 			for _, w := range warns {
 				logf(ctx, levelWarn, "service %s/%s: %s", ns.Namespace, stub.ServiceName, w)
 			}
@@ -331,6 +337,7 @@ func gather(ctx context.Context, nomad *nomadClient, nodeID, tagPrefix string) (
 					Port:    ep.Port,
 					Path:    ep.Path,
 					Backend: backend,
+					Proxy:   ep.Proxy,
 				}
 				// Only one listener can exist per Service port on this host.
 				portKey := fmt.Sprintf("%s/%d", want.Service, want.Port)

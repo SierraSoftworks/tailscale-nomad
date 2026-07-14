@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // serviceSpec is the Tailscale publication a Nomad service asked for via its
@@ -17,9 +18,34 @@ type serviceSpec struct {
 
 // endpoint is one tailnet-facing port of a Tailscale Service.
 type endpoint struct {
-	Proto string // http, https, tcp, tls-terminated-tcp
-	Port  int    // tailnet-facing port
-	Path  string // mount path for http/https handlers ("" = root)
+	Proto string      // http, https, tcp, tls-terminated-tcp
+	Port  int         // tailnet-facing port
+	Path  string      // mount path for http/https handlers ("" = root)
+	Proxy proxyConfig // resource limits and timeouts for this endpoint
+}
+
+// proxyConfig controls resource use and stalled-connection handling for one
+// published endpoint. Zero disables the corresponding limit or timeout.
+type proxyConfig struct {
+	MaxConnections               int
+	ReadHeaderTimeout            time.Duration
+	IdleTimeout                  time.Duration
+	BackendDialTimeout           time.Duration
+	BackendResponseHeaderTimeout time.Duration
+	BackendIdleConnectionTimeout time.Duration
+	ExpectContinueTimeout        time.Duration
+}
+
+func defaultProxyConfig(maxConnections int) proxyConfig {
+	return proxyConfig{
+		MaxConnections:               maxConnections,
+		ReadHeaderTimeout:            10 * time.Second,
+		IdleTimeout:                  2 * time.Minute,
+		BackendDialTimeout:           10 * time.Second,
+		BackendResponseHeaderTimeout: 30 * time.Second,
+		BackendIdleConnectionTimeout: 90 * time.Second,
+		ExpectContinueTimeout:        time.Second,
+	}
 }
 
 var protoTags = map[string]bool{
@@ -42,10 +68,17 @@ func hasEnableTag(tags []string, prefix string) bool {
 //	tailscale.tcp=<port>               TCP passthrough endpoint
 //	tailscale.tls-terminated-tcp=<port> TLS-terminated TCP endpoint
 //	tailscale.path=<path>              mount path for http/https handlers
+//	tailscale.max-connections=<count>   simultaneous connections per endpoint
+//	tailscale.read-header-timeout=<duration>
+//	tailscale.idle-timeout=<duration>
+//	tailscale.backend-dial-timeout=<duration>
+//	tailscale.backend-response-header-timeout=<duration>
+//	tailscale.backend-idle-connection-timeout=<duration>
+//	tailscale.expect-continue-timeout=<duration>
 //
 // It returns nil when the service has not opted in. Problems that don't
 // prevent publication are returned as warnings.
-func parseTags(prefix, nomadService string, tags []string) (*serviceSpec, []string) {
+func parseTags(prefix, nomadService string, tags []string, defaults proxyConfig) (*serviceSpec, []string) {
 	if !hasEnableTag(tags, prefix) {
 		return nil, nil
 	}
@@ -53,6 +86,7 @@ func parseTags(prefix, nomadService string, tags []string) (*serviceSpec, []stri
 	var warns []string
 	name := nomadService
 	path := ""
+	proxy := defaults
 	ports := map[int]string{} // tailnet port -> proto
 
 	for _, tag := range tags {
@@ -81,6 +115,25 @@ func parseTags(prefix, nomadService string, tags []string) (*serviceSpec, []stri
 				continue
 			}
 			path = value
+		case key == "max-connections":
+			count, err := strconv.Atoi(value)
+			if err != nil || count < 0 {
+				warns = append(warns, fmt.Sprintf("ignoring %s.%s=%q: must be a non-negative integer", prefix, key, value))
+				continue
+			}
+			proxy.MaxConnections = count
+		case key == "read-header-timeout":
+			parseProxyDuration(prefix, key, value, &proxy.ReadHeaderTimeout, &warns)
+		case key == "idle-timeout":
+			parseProxyDuration(prefix, key, value, &proxy.IdleTimeout, &warns)
+		case key == "backend-dial-timeout":
+			parseProxyDuration(prefix, key, value, &proxy.BackendDialTimeout, &warns)
+		case key == "backend-response-header-timeout":
+			parseProxyDuration(prefix, key, value, &proxy.BackendResponseHeaderTimeout, &warns)
+		case key == "backend-idle-connection-timeout":
+			parseProxyDuration(prefix, key, value, &proxy.BackendIdleConnectionTimeout, &warns)
+		case key == "expect-continue-timeout":
+			parseProxyDuration(prefix, key, value, &proxy.ExpectContinueTimeout, &warns)
 		case protoTags[key]:
 			port, err := strconv.Atoi(value)
 			if err != nil || port < 1 || port > 65535 {
@@ -105,7 +158,7 @@ func parseTags(prefix, nomadService string, tags []string) (*serviceSpec, []stri
 
 	spec := &serviceSpec{Service: "svc:" + name}
 	for port, proto := range ports {
-		ep := endpoint{Proto: proto, Port: port}
+		ep := endpoint{Proto: proto, Port: port, Proxy: proxy}
 		if proto == "http" || proto == "https" {
 			ep.Path = path
 		}
@@ -113,4 +166,13 @@ func parseTags(prefix, nomadService string, tags []string) (*serviceSpec, []stri
 	}
 	sort.Slice(spec.Endpoints, func(i, j int) bool { return spec.Endpoints[i].Port < spec.Endpoints[j].Port })
 	return spec, warns
+}
+
+func parseProxyDuration(prefix, key, value string, dst *time.Duration, warns *[]string) {
+	d, err := time.ParseDuration(value)
+	if err != nil || d < 0 {
+		*warns = append(*warns, fmt.Sprintf("ignoring %s.%s=%q: must be a non-negative duration", prefix, key, value))
+		return
+	}
+	*dst = d
 }

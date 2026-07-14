@@ -224,6 +224,13 @@ group "app" {
 | `tailscale.tcp=<port>` | TCP passthrough endpoint. |
 | `tailscale.tls-terminated-tcp=<port>` | TCP endpoint with TLS terminated by tsnet. |
 | `tailscale.path=<path>` | Mount path for http/https endpoints — requests outside it get a 404; the path is forwarded to the backend unchanged. |
+| `tailscale.max-connections=<count>` | Maximum simultaneous client connections per endpoint. Defaults to `-max-connections`; `0` disables the limit. |
+| `tailscale.read-header-timeout=<duration>` | Maximum time to read HTTP request headers. Default `10s`; `0` disables it. |
+| `tailscale.idle-timeout=<duration>` | Maximum HTTP keep-alive idle time between requests. Default `2m`; `0` disables it. |
+| `tailscale.backend-dial-timeout=<duration>` | Maximum time to connect to the allocation backend. Default `10s`; applies to HTTP and TCP; `0` disables it. |
+| `tailscale.backend-response-header-timeout=<duration>` | Maximum time HTTP backends may take to return response headers after the request body is written. Default `30s`; `0` disables it. |
+| `tailscale.backend-idle-connection-timeout=<duration>` | Maximum time an idle HTTP backend connection remains pooled. Default `90s`; `0` disables it. |
+| `tailscale.expect-continue-timeout=<duration>` | Time to wait for an HTTP backend's `100 Continue` response before sending the request body. Default `1s`; `0` sends it immediately. |
 
 Protocol tags are repeatable — e.g. `tailscale.https=443` plus
 `tailscale.tcp=5432` publishes two endpoints of the same Service. A valid
@@ -231,6 +238,13 @@ Service host must advertise **all** ports in the Service's definition, so
 keep the tags in sync with what the admin console defines. Only one backend
 can serve a given Service port per node (path-based fan-out to multiple
 backends on one port is not supported).
+
+Proxy configuration tags apply to every endpoint declared by the same Nomad
+service. Each endpoint enforces its connection limit independently. Durations
+use Go syntax such as `500ms`, `10s`, or `2m`. Invalid values are ignored with
+a warning and retain the connector defaults. Changing one of these tags drains
+and recreates the affected endpoint so the new settings apply to all new
+connections.
 
 ## Connector flags
 
@@ -242,11 +256,28 @@ backends on one port is not supported).
 | `-interval` | `30s` | Full reconcile interval (the event stream triggers reconciles sooner). |
 | `-drain-grace` | `30s` | How long in-flight connections of a withdrawn endpoint get to finish. |
 | `-shutdown-grace` | `20s` | Same, for connector shutdown; keep below the task's `kill_timeout`. |
+| `-max-connections` | `256` | Maximum simultaneous client connections per published endpoint; `0` disables the limit. |
 | `-ts-dir` | os-specific | tsnet state directory — must persist across restarts. |
 | `-ts-hostname` | `nomad-tailscale-connector` | Tailnet device name. |
 | `-ts-tags` | none | ACL tags to advertise (usually conferred by the tagged auth key instead). |
 | `-dry-run` | off | Log what would be published without joining the tailnet. |
 | `-once` | off | Single reconcile pass, then drain and exit — handy with `-dry-run`. |
+
+### Capacity planning
+
+Request and response bodies are streamed, so memory use does not grow with the
+size of an individual upload or download. Resource use does grow with the
+number of simultaneous connections: each connection consumes client and
+backend socket state, goroutines, tsnet buffers, and HTTP copy buffers. Raw TCP
+and upgraded HTTP connections require two long-lived copy paths.
+
+The default `-max-connections=256` is a safety ceiling per published endpoint,
+not a guarantee that the bundled task resources can sustain that volume across
+many endpoints. Increase the job's CPU and memory limits after load testing if
+you raise this ceiling, disable it, publish many busy endpoints, or expect many
+slow or upgraded connections. Monitor process memory, CPU, open file
+descriptors, connection latency, and Nomad task OOM/restart events when sizing
+the connector.
 
 Enrolment credentials come from `TS_AUTHKEY` or `TS_CLIENT_SECRET` (an OAuth
 client secret), read by tsnet itself.
