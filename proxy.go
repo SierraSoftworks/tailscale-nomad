@@ -14,8 +14,11 @@ import (
 	"time"
 
 	humane "github.com/sierrasoftworks/humane-errors-go"
+	"golang.org/x/net/netutil"
 	"tailscale.com/tsnet"
 )
+
+const backendKeepAlive = 30 * time.Second
 
 // publisher opens tailnet listeners for endpoints. Implemented by
 // tsnetPublisher; tests and -dry-run substitute fakes.
@@ -72,32 +75,57 @@ func (p *tsnetPublisher) Publish(ep desiredEndpoint) (publishedEndpoint, error) 
 	if ln.FQDN != "" {
 		logf(context.Background(), levelInfo, "%s is reachable at %s (port %d, %s)", ep.Service, ln.FQDN, ep.Port, ep.Proto)
 	}
+	var listener net.Listener = ln
+	if ep.Proxy.MaxConnections > 0 {
+		listener = netutil.LimitListener(listener, ep.Proxy.MaxConnections)
+	}
 
 	switch ep.Proto {
 	case "http", "https":
 		// TLS is already terminated by tsnet for https endpoints, so both
 		// modes serve plain HTTP here.
-		return newHTTPEndpoint(ep, ln), nil
+		return newHTTPEndpoint(ep, listener), nil
 	default:
-		return newTCPEndpoint(ep, ln), nil
+		return newTCPEndpoint(ep, listener), nil
 	}
 }
 
 // httpEndpoint reverse-proxies HTTP requests to the backend.
 type httpEndpoint struct {
-	backend atomic.Value // string, "host:port"
-	ln      net.Listener
-	srv     *http.Server
-	conns   atomic.Int64
+	backend   atomic.Value // string, "host:port"
+	ln        net.Listener
+	srv       *http.Server
+	transport *http.Transport
+
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
 }
 
 func newHTTPEndpoint(ep desiredEndpoint, ln net.Listener) *httpEndpoint {
-	e := &httpEndpoint{ln: ln}
+	e := &httpEndpoint{ln: ln, conns: map[net.Conn]struct{}{}}
 	e.backend.Store(ep.Backend)
+	idleConnections := ep.Proxy.MaxConnections
+	if idleConnections == 0 {
+		idleConnections = 256
+	}
+	e.transport = &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: ep.Proxy.BackendDialTimeout, KeepAlive: backendKeepAlive}).DialContext,
+		MaxIdleConns:          idleConnections,
+		MaxIdleConnsPerHost:   idleConnections,
+		MaxConnsPerHost:       ep.Proxy.MaxConnections,
+		IdleConnTimeout:       ep.Proxy.BackendIdleConnectionTimeout,
+		ResponseHeaderTimeout: ep.Proxy.BackendResponseHeaderTimeout,
+		ExpectContinueTimeout: ep.Proxy.ExpectContinueTimeout,
+	}
 
 	proxy := &httputil.ReverseProxy{
+		Transport: e.transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetXForwarded()
+			if ep.Proto == "https" {
+				pr.Out.Header.Set("X-Forwarded-Proto", "https")
+			}
 			pr.Out.URL.Scheme = "http"
 			pr.Out.URL.Host = e.backend.Load().(string)
 		},
@@ -115,18 +143,12 @@ func newHTTPEndpoint(ep desiredEndpoint, ln net.Listener) *httpEndpoint {
 	}
 
 	e.srv = &http.Server{
-		Handler: handler,
-		ConnState: func(_ net.Conn, st http.ConnState) {
-			switch st {
-			case http.StateNew:
-				e.conns.Add(1)
-			case http.StateClosed, http.StateHijacked:
-				e.conns.Add(-1)
-			}
-		},
+		Handler:           handler,
+		ReadHeaderTimeout: ep.Proxy.ReadHeaderTimeout,
+		IdleTimeout:       ep.Proxy.IdleTimeout,
 	}
 	go func() {
-		err := e.srv.Serve(ln)
+		err := e.srv.Serve(&trackingListener{Listener: ln, endpoint: e})
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			logf(context.Background(), levelWarn, "http serving for %s ended: %v", ep, err)
 		}
@@ -134,16 +156,71 @@ func newHTTPEndpoint(ep desiredEndpoint, ln net.Listener) *httpEndpoint {
 	return e
 }
 
-func (e *httpEndpoint) SetBackend(backend string) { e.backend.Store(backend) }
+func (e *httpEndpoint) SetBackend(backend string) {
+	e.backend.Store(backend)
+	e.transport.CloseIdleConnections()
+}
 
 func (e *httpEndpoint) Drain() {
 	e.ln.Close()
 	e.srv.SetKeepAlivesEnabled(false)
+	e.transport.CloseIdleConnections()
 }
 
-func (e *httpEndpoint) Idle() bool { return e.conns.Load() == 0 }
+func (e *httpEndpoint) Idle() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.conns) == 0
+}
 
-func (e *httpEndpoint) Close() { e.srv.Close() }
+func (e *httpEndpoint) Close() {
+	e.ln.Close()
+	e.srv.Close()
+	e.transport.CloseIdleConnections()
+
+	e.mu.Lock()
+	conns := make([]net.Conn, 0, len(e.conns))
+	for c := range e.conns {
+		conns = append(conns, c)
+	}
+	e.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+type trackingListener struct {
+	net.Listener
+	endpoint *httpEndpoint
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	tc := &trackingConn{Conn: c, endpoint: l.endpoint}
+	l.endpoint.mu.Lock()
+	l.endpoint.conns[tc] = struct{}{}
+	l.endpoint.mu.Unlock()
+	return tc, nil
+}
+
+type trackingConn struct {
+	net.Conn
+	endpoint *httpEndpoint
+	once     sync.Once
+}
+
+func (c *trackingConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		c.endpoint.mu.Lock()
+		delete(c.endpoint.conns, c)
+		c.endpoint.mu.Unlock()
+	})
+	return err
+}
 
 // tcpEndpoint proxies raw TCP connections (TLS already terminated by tsnet
 // for tls-terminated-tcp endpoints) to the backend.
@@ -151,13 +228,14 @@ type tcpEndpoint struct {
 	desc    string
 	backend atomic.Value // string, "host:port"
 	ln      net.Listener
+	proxy   proxyConfig
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
 }
 
 func newTCPEndpoint(ep desiredEndpoint, ln net.Listener) *tcpEndpoint {
-	e := &tcpEndpoint{desc: ep.String(), ln: ln, conns: map[net.Conn]struct{}{}}
+	e := &tcpEndpoint{desc: ep.String(), ln: ln, proxy: ep.Proxy, conns: map[net.Conn]struct{}{}}
 	e.backend.Store(ep.Backend)
 	go e.acceptLoop()
 	return e
@@ -179,7 +257,7 @@ func (e *tcpEndpoint) proxyConn(client net.Conn) {
 	defer client.Close()
 
 	addr := e.backend.Load().(string)
-	backend, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	backend, err := net.DialTimeout("tcp", addr, e.proxy.BackendDialTimeout)
 	if err != nil {
 		logf(context.Background(), levelWarn, "%s", display(humane.Wrap(err,
 			fmt.Sprintf("%s: could not dial backend %s", e.desc, addr),

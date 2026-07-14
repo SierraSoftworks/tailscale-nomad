@@ -125,6 +125,11 @@ job "tailscale-connector" {
       kill_timeout = "30s"
 
       resources {
+        # Proxy bodies are streamed, but memory, CPU, sockets, and goroutines
+        # scale with simultaneous connections across all published endpoints.
+        # Increase these limits after load testing when raising
+        # -max-connections, serving many endpoints, or carrying many slow or
+        # upgraded connections.
         cpu    = 100
         memory = 128
       }

@@ -169,6 +169,24 @@ func TestReconcilePathChangeRecreatesListener(t *testing.T) {
 	}
 }
 
+func TestReconcileProxyConfigChangeRecreatesListener(t *testing.T) {
+	r, pub, _ := testReconciler(t)
+	v1 := ep("svc:web", "https", 443, "10.0.0.1:2000")
+	v1.Proxy = defaultProxyConfig(256)
+	v2 := v1
+	v2.Proxy.MaxConnections = 64
+
+	r.reconcile(context.Background(), []desiredEndpoint{v1})
+	r.reconcile(context.Background(), []desiredEndpoint{v2})
+
+	if len(pub.published) != 2 {
+		t.Fatalf("expected proxy config change to republish endpoint, got %d publications", len(pub.published))
+	}
+	if !pub.published[0].drained {
+		t.Fatal("old endpoint was not drained after proxy config change")
+	}
+}
+
 func TestReconcilePublishErrorRetries(t *testing.T) {
 	r, pub, _ := testReconciler(t)
 	web := ep("svc:web", "https", 443, "10.0.0.1:2000")
