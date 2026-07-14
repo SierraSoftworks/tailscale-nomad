@@ -54,7 +54,8 @@ job "tailscale-connector" {
       }
 
       env {
-        # The connector only publishes services placed on its own node.
+        # Used for node-scoped services and loopback registrations. Nomad also
+        # supplies NOMAD_DC for the default datacenter scope.
         CONNECTOR_NODE_ID = "${node.unique.id}"
 
         # OpenTelemetry is off unless an exporter is configured. Point it at a
