@@ -208,6 +208,35 @@ func TestReconcilePublishErrorRetries(t *testing.T) {
 	}
 }
 
+// The stats a pass returns are what the health report shows an operator
+// during an incident, so they have to describe the pass, not the reconciler's
+// history.
+func TestReconcileReportsStats(t *testing.T) {
+	r, pub, _ := testReconciler(t)
+	web := ep("svc:web", "https", 443, "10.0.0.1:2000")
+	db := ep("svc:db", "tcp", 5432, "10.0.0.1:2001")
+	pub.fail[db.key()] = fmt.Errorf("not yet approved")
+
+	stats := r.reconcile(context.Background(), []desiredEndpoint{web, db})
+	if stats != (reconcileStats{Desired: 2, Published: 1, Failed: 1, Active: 1}) {
+		t.Fatalf("first pass stats = %+v", stats)
+	}
+
+	moved := ep("svc:web", "https", 443, "10.0.0.1:2002")
+	delete(pub.fail, db.key())
+	stats = r.reconcile(context.Background(), []desiredEndpoint{moved, db})
+	if stats != (reconcileStats{Desired: 2, Published: 1, Moved: 1, Active: 2}) {
+		t.Fatalf("second pass stats = %+v", stats)
+	}
+
+	// A withdrawn endpoint with connections still in flight counts as
+	// draining until its grace expires.
+	stats = r.reconcile(context.Background(), []desiredEndpoint{moved})
+	if stats != (reconcileStats{Desired: 1, Withdrawn: 1, Active: 1, Draining: 1}) {
+		t.Fatalf("third pass stats = %+v", stats)
+	}
+}
+
 func TestShutdownWaitsForConnections(t *testing.T) {
 	r, pub, _ := testReconciler(t)
 	r.reconcile(context.Background(), []desiredEndpoint{

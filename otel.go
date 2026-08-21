@@ -74,6 +74,13 @@ var (
 	mNomadRequestDuration = must(meter.Float64Histogram("connector.nomad.client.request.duration",
 		metric.WithDescription("Duration of Nomad HTTP API requests, tagged by route and outcome."),
 		metric.WithUnit("s")))
+	mReconcileConsecutiveFailures = must(meter.Int64Gauge("connector.reconcile.consecutive_failures",
+		metric.WithDescription("Authoritative reconciles that have failed in a row; reset by the first success."),
+		metric.WithUnit("{failure}")))
+	mHealthy = must(meter.Int64Gauge("connector.health.healthy",
+		metric.WithDescription("Whether /health would answer 200 (1) or 503 (0).")))
+	mReady = must(meter.Int64Gauge("connector.health.ready",
+		metric.WithDescription("Whether the connector has completed its first authoritative reconcile (1) or not (0).")))
 )
 
 func must[T any](v T, err error) T {

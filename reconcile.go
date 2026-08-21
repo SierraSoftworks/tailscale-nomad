@@ -45,6 +45,19 @@ func (e desiredEndpoint) String() string {
 	return s
 }
 
+// reconcileStats summarises what one reconcile pass did. It feeds the health
+// report, so an operator can see the connector's converged shape without
+// having to correlate log lines.
+type reconcileStats struct {
+	Desired   int
+	Published int
+	Withdrawn int
+	Moved     int
+	Failed    int
+	Active    int
+	Draining  int
+}
+
 type activeEndpoint struct {
 	spec desiredEndpoint
 	pe   publishedEndpoint
@@ -92,9 +105,9 @@ func newReconciler(pub publisher, drainGrace time.Duration) *reconciler {
 //   - drained endpoints are force-closed once idle or after the drain grace.
 //
 // Failed publishes are retried on subsequent passes. It runs as a child span
-// of the reconcile pass, recording per-pass counts as span attributes and
-// metrics.
-func (r *reconciler) reconcile(ctx context.Context, desired []desiredEndpoint) {
+// of the reconcile pass, recording per-pass counts as span attributes, metrics,
+// and the returned stats.
+func (r *reconciler) reconcile(ctx context.Context, desired []desiredEndpoint) reconcileStats {
 	ctx, span := tracer.Start(ctx, "apply")
 	defer span.End()
 
@@ -159,6 +172,16 @@ func (r *reconciler) reconcile(ctx context.Context, desired []desiredEndpoint) {
 	}
 	mEndpointsActive.Record(ctx, int64(len(r.active)))
 	mEndpointsDraining.Record(ctx, int64(len(r.draining)))
+
+	return reconcileStats{
+		Desired:   len(desired),
+		Published: published,
+		Withdrawn: withdrawn,
+		Moved:     moved,
+		Failed:    failed,
+		Active:    len(r.active),
+		Draining:  len(r.draining),
+	}
 }
 
 // publish opens a listener for one endpoint, wrapped in its own span so a slow

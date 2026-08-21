@@ -24,6 +24,15 @@ job "tailscale-connector" {
   group "connector" {
     # The connector is the data path for the Services it hosts, so recover
     # aggressively if it fails.
+    #
+    # This is also what catches a connector that has lost its view of the
+    # cluster but is still serving traffic: it exits non-zero after
+    # -max-reconcile-failures consecutive failed reconciles and is restarted
+    # here. Where a restart cannot help — an allocation whose workload
+    # identity Nomad has invalidated can only be fixed by a replacement
+    # allocation — exiting at least stops the connector advertising a frozen
+    # world, and makes the failure visible in `nomad alloc status` instead of
+    # silent.
     restart {
       attempts = 5
       interval = "10m"
@@ -31,11 +40,54 @@ job "tailscale-connector" {
       mode     = "delay"
     }
 
+    # A dynamic port for the connector's health endpoint. It is only ever
+    # polled by the local Nomad client, and deliberately does not ride the
+    # tailnet — it has to stay reachable precisely when the tailnet is the
+    # thing that has broken.
+    #
+    # To keep it off the node's LAN address entirely, configure a loopback
+    # host_network on your clients and add `host_network = "loopback"` here.
+    network {
+      port "health" {}
+    }
+
     # Persists the connector's tailnet identity (tsnet state). Without it a
     # replaced allocation would join the tailnet as a brand-new device.
     volume "state" {
       type   = "host"
       source = "tailscale-connector-state"
+    }
+
+    # Lets Nomad restart the connector when it can no longer see Nomad.
+    #
+    # A connector that has lost its view of the cluster keeps proxying traffic
+    # to whatever backends it last observed, so it looks healthy from the
+    # outside while silently serving a frozen world. /health reports that
+    # state, and check_restart acts on it.
+    #
+    # This service carries no tailscale.* tags, so the connector ignores its
+    # own registration.
+    service {
+      name     = "tailscale-connector"
+      provider = "nomad"
+      port     = "health"
+
+      check {
+        name     = "connector-health"
+        type     = "http"
+        path     = "/health"
+        interval = "15s"
+        timeout  = "3s"
+
+        check_restart {
+          # ~45s of sustained unhealthiness before recycling the task. The
+          # grace covers startup: joining the tailnet and completing the first
+          # reconcile takes a few seconds, and the connector reports
+          # "starting" (healthy) until then anyway.
+          limit = 3
+          grace = "60s"
+        }
+      }
     }
 
     task "connector" {
@@ -106,6 +158,11 @@ job "tailscale-connector" {
         args = [
           "-ts-dir=/data/tsnet",
           "-ts-hostname=nomad-${node.unique.name}",
+
+          # Serve /health and /ready on the allocated "health" port so the
+          # check above can poll them. (The connector also picks this up from
+          # NOMAD_ADDR_health on its own; passing it is just explicit.)
+          "-health-addr=${NOMAD_ADDR_health}",
         ]
       }
 
