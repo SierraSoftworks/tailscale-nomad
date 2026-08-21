@@ -31,6 +31,35 @@ type nomadClient struct {
 	base  string
 	addr  string // as configured, for error messages
 	token string
+
+	// health, when set, is told about event-stream connectivity. It is
+	// optional so tests and one-shot callers can build a bare client.
+	health *health
+}
+
+// errIdentityRejected marks Nomad API rejections that mean this allocation's
+// workload identity will not be accepted again, no matter how long the
+// connector waits.
+//
+// The case that matters in practice: when a Nomad client misses its heartbeats
+// — which happens if the control plane rides a link that goes away, such as a
+// Tailscale interface being restarted underneath it — the server marks the node
+// down and every allocation on it terminal. Nomad then refuses the allocation's
+// signed identity with "allocation is terminal", while the process itself keeps
+// running and keeps serving traffic from a view of the world that can no longer
+// be refreshed. Retrying cannot fix that; only a new allocation can, so the
+// connector treats it as immediately fatal rather than spending its failure
+// budget on a foregone conclusion.
+var errIdentityRejected = errors.New("Nomad has invalidated this allocation's workload identity")
+
+// identityRejectionPhrases are the Nomad error bodies that indicate the
+// allocation's identity is permanently dead, as opposed to an ACL policy that
+// an operator can still fix without a restart.
+var identityRejectionPhrases = []string{
+	"allocation is terminal",
+	"allocation is not running",
+	"invalid identity token",
+	"identity token is expired",
 }
 
 func newNomadClient(addr, token string) *nomadClient {
@@ -74,6 +103,13 @@ func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*h
 		resp.Body.Close()
 		msg := fmt.Sprintf("GET %s: %s: %s", path, resp.Status, strings.TrimSpace(string(body)))
 		if resp.StatusCode == http.StatusForbidden {
+			if rejectsIdentity(string(body)) {
+				return nil, humane.Wrap(errIdentityRejected, msg,
+					"Nomad marks an allocation terminal when its node misses heartbeats, and then refuses that allocation's identity token forever — restarting the task reuses the same dead identity, so only a replacement allocation recovers it.",
+					"Check whether the Nomad client lost contact with its servers: a node whose control-plane traffic rides the same interface as your VPN goes down whenever that interface does.",
+					"Give the Nomad client a path to its servers that does not depend on Tailscale, or raise the servers' heartbeat_grace, so a brief link flap cannot terminate every allocation on the node.",
+				)
+			}
 			return nil, humane.New(msg,
 				"With ACLs enabled, the connector's workload identity needs a policy granting read-job across namespaces (plus agent:read when the node ID is auto-detected).",
 				`Apply it with: nomad acl policy apply -namespace default -job tailscale-connector tailscale-connector policy.hcl — see "Grant API access" in the README.`,
@@ -141,6 +177,18 @@ func nomadRoute(path string) string {
 	default:
 		return path
 	}
+}
+
+// rejectsIdentity reports whether a Nomad 403 body describes a permanently
+// invalidated workload identity rather than a fixable ACL denial.
+func rejectsIdentity(body string) bool {
+	lower := strings.ToLower(body)
+	for _, phrase := range identityRejectionPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // serviceListStub is one entry of GET /v1/services: a service name with the
@@ -234,8 +282,10 @@ func (c *nomadClient) watchEvents(ctx context.Context, updates chan<- serviceEve
 		if lifetime > time.Minute {
 			backoff = time.Second
 		}
-		logf(ctx, levelWarn, "event stream disconnected; reconnecting in %s: %s", backoff, display(classifyStreamErr(err, lifetime)))
+		cause := classifyStreamErr(err, lifetime)
+		logf(ctx, levelWarn, "event stream disconnected; reconnecting in %s: %s", backoff, display(cause))
 		mStreamReconnects.Add(ctx, 1)
+		c.health.streamState(ctx, false, cause)
 		select {
 		case updates <- serviceEventBatch{Repair: true}:
 		case <-ctx.Done():
@@ -281,6 +331,7 @@ func (c *nomadClient) streamEvents(ctx context.Context, updates chan<- serviceEv
 	// The long-lived stream deliberately gets no span (it would run for the
 	// life of the process); it is tracked with an up/down gauge instead.
 	mStreamUp.Record(ctx, 1)
+	c.health.streamState(ctx, true, nil)
 	defer mStreamUp.Record(context.Background(), 0)
 
 	dec := json.NewDecoder(resp.Body)

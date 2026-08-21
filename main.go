@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -64,11 +65,23 @@ func run() int {
 		tsTags         = flag.String("ts-tags", "", "comma-separated ACL tags to advertise (Service hosts must be tagged; usually already conferred by a tagged auth key)")
 		dryRun         = flag.Bool("dry-run", false, "log what would be published without joining the tailnet or proxying traffic")
 		once           = flag.Bool("once", false, "run a single reconcile pass, then drain and exit")
+		healthAddr     = flag.String("health-addr", "", `address for the HTTP health endpoint, e.g. 127.0.0.1:9797 (default: $CONNECTOR_HEALTH_ADDR, else the Nomad-allocated "health" port, else disabled; "off" disables it)`)
+		unhealthyAfter = flag.Int("unhealthy-reconcile-failures", 3, "consecutive failed reconciles before /health reports unhealthy; 0 keeps it always healthy")
+		fatalAfter     = flag.Int("max-reconcile-failures", 5, "consecutive failed reconciles before exiting non-zero so the task's restart stanza can recover; 0 never exits")
+		retryInterval  = flag.Duration("failure-retry-interval", 15*time.Second, "how soon to retry after a failed reconcile; doubles up to the smaller of a minute and -interval, never dropping below this value")
 		showVersion    = flag.Bool("version", false, "print the connector version and exit")
 	)
 	flag.Parse()
 	if *maxConnections < 0 {
 		logf(context.Background(), levelError, "-max-connections must be zero or greater")
+		return 2
+	}
+	if *unhealthyAfter < 0 || *fatalAfter < 0 {
+		logf(context.Background(), levelError, "-unhealthy-reconcile-failures and -max-reconcile-failures must be zero or greater")
+		return 2
+	}
+	if *retryInterval <= 0 {
+		logf(context.Background(), levelError, "-failure-retry-interval must be greater than zero")
 		return 2
 	}
 
@@ -127,6 +140,22 @@ func run() int {
 	logf(ctx, levelInfo, "nomad-tailscale-connector %s: nomad=%s node=%s datacenter=%s tag-prefix=%s drain-grace=%s dry-run=%v",
 		version, addr, node, dc, *tagPrefix, *drainGrace, *dryRun)
 
+	// The connector can keep proxying traffic long after it has lost the
+	// ability to see Nomad, so liveness is tracked explicitly rather than
+	// inferred from the process still being alive. health backs both recovery
+	// paths: the HTTP endpoint Nomad's check_restart polls, and the
+	// consecutive-failure budget that makes the process exit non-zero.
+	hc := newHealth(version, node, dc, *unhealthyAfter, *fatalAfter)
+	nomad.health = hc
+	if !*once {
+		hsrv, herr := serveHealth(ctx, resolveHealthAddr(*healthAddr), hc)
+		if herr != nil {
+			logf(ctx, levelError, "%s", display(herr))
+			return 1
+		}
+		defer hsrv.Close()
+	}
+
 	var pub publisher = dryRunPublisher{}
 	if !*dryRun {
 		if *tsDir != "" {
@@ -179,7 +208,12 @@ func run() int {
 	// become child spans of this one. trigger records what woke the pass
 	// (startup, an event-stream notification, the periodic interval, or a
 	// draining deadline) so traces and metrics can be sliced by cause.
-	pass := func(ctx context.Context, trigger string, repair bool, replay []serviceEventBatch) {
+	//
+	// It reports what the pass established about Nomad's reachability, and —
+	// when the connector should stop trying — the failure that ended it:
+	// either the budget is spent, or Nomad has rejected the allocation's
+	// identity outright, which no amount of retrying will undo.
+	pass := func(ctx context.Context, trigger string, repair bool, replay []serviceEventBatch) (reach passOutcome, giveUp error) {
 		ctx, span := tracer.Start(ctx, "reconcile", trace.WithAttributes(
 			attribute.String("connector.trigger", trigger),
 			attribute.String("nomad.node.id", node),
@@ -229,11 +263,26 @@ func run() int {
 			outcome = "error"
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "gather failed")
-			logf(ctx, levelWarn, "skipping reconcile, could not list Nomad services: %s", display(err))
+			// Only an authoritative pass proves anything about Nomad's
+			// reachability, so only its failures spend the budget.
+			consecutive := hc.reconcileFailed(ctx, err)
+			logf(ctx, levelWarn, "skipping reconcile (%s in a row), could not list Nomad services: %s",
+				plural(consecutive, "failure", "failures"), display(err))
+			span.SetAttributes(attribute.Int("connector.reconcile.consecutive_failures", consecutive))
 			rec.sweepDraining(ctx, false)
+			reach = passUnreachable
+			if hc.fatalBudgetSpent() || errors.Is(err, errIdentityRejected) {
+				giveUp = err
+			}
 		} else {
 			span.SetAttributes(attribute.Int("connector.endpoints.desired", len(desired)))
-			rec.reconcile(ctx, desired)
+			stats := rec.reconcile(ctx, desired)
+			if repair {
+				hc.reconcileSucceeded(ctx, stats)
+				reach = passReachable
+			} else {
+				hc.endpointsReconciled(ctx, stats)
+			}
 		}
 
 		span.SetAttributes(attribute.String("connector.outcome", outcome))
@@ -243,17 +292,62 @@ func run() int {
 		))
 		mReconcileDuration.Record(ctx, time.Since(started).Seconds(),
 			metric.WithAttributes(attribute.String("trigger", trigger)))
+		return reach, giveUp
 	}
 
 	startTrigger := "startup"
 	if *once {
 		startTrigger = "once"
 	}
-	pass(ctx, startTrigger, true, nil)
+	reach, giveUp := pass(ctx, startTrigger, true, nil)
 	if *once {
 		rec.shutdown(ctx, *shutdownGrace)
+		// A single pass is a smoke test (the job exposes it as the "dry-run"
+		// action); report its verdict through the exit code.
+		if reach == passUnreachable {
+			return 1
+		}
 		return 0
 	}
+
+	// A failed pass schedules its own retry rather than waiting out the full
+	// repair interval: the failure budget is only meaningful if failures can
+	// accumulate at a useful rate, and a connector that has lost sight of
+	// Nomad should be trying to get it back.
+	// Cap the backoff at a minute, or at -interval when that is shorter —
+	// past that point the regular repair pass is already retrying sooner and
+	// the extra timer earns nothing. The floor keeps the cap from dropping
+	// below the operator's stated minimum spacing: -failure-retry-interval is
+	// how often they are willing to have a failing agent polled, so a shorter
+	// -interval must not quietly override it.
+	retryCap := time.Minute
+	if *interval < retryCap {
+		retryCap = *interval
+	}
+	if retryCap < *retryInterval {
+		retryCap = *retryInterval
+	}
+	retryDelay := *retryInterval
+	var retryAt time.Time
+	scheduleRetry := func(reach passOutcome) {
+		switch reach {
+		case passUnreachable:
+			retryAt = time.Now().Add(retryDelay)
+			if retryDelay *= 2; retryDelay > retryCap {
+				retryDelay = retryCap
+			}
+		case passReachable:
+			retryAt, retryDelay = time.Time{}, *retryInterval
+		case passInconclusive:
+			// The pass re-used the cached snapshot, so it neither confirms
+			// nor denies a problem; leave any pending retry where it is.
+		}
+	}
+
+	if giveUp != nil {
+		return giveUpAndDrain(rec, hc, *shutdownGrace, giveUp)
+	}
+	scheduleRetry(reach)
 
 	repairTimer := time.NewTimer(*interval)
 	defer repairTimer.Stop()
@@ -265,6 +359,15 @@ func run() int {
 				until = 250 * time.Millisecond
 			}
 			deadlineTimer = time.After(until)
+		}
+
+		var retryTimer <-chan time.Time
+		if !retryAt.IsZero() {
+			until := time.Until(retryAt)
+			if until < 250*time.Millisecond {
+				until = 250 * time.Millisecond
+			}
+			retryTimer = time.After(until)
 		}
 
 		select {
@@ -309,15 +412,71 @@ func run() int {
 				default:
 				}
 			}
-			pass(ctx, "event", repair, replay)
-			continue
+			reach, giveUp = pass(ctx, "event", repair, replay)
+		case <-retryTimer:
+			reach, giveUp = pass(ctx, "retry", true, nil)
 		case <-deadlineTimer:
-			pass(ctx, "deadline", false, nil)
+			reach, giveUp = pass(ctx, "deadline", false, nil)
 		case <-repairTimer.C:
-			pass(ctx, "interval", true, nil)
+			reach, giveUp = pass(ctx, "interval", true, nil)
 			repairTimer.Reset(*interval)
 		}
+
+		if giveUp != nil {
+			return giveUpAndDrain(rec, hc, *shutdownGrace, giveUp)
+		}
+		scheduleRetry(reach)
 	}
+}
+
+// passOutcome reports what a reconcile pass established about Nomad's
+// reachability. An event-driven pass re-uses the cached registration snapshot
+// and so establishes nothing either way; only an authoritative pass, which
+// re-reads the API, can confirm or deny that the connector still has a working
+// view of the cluster.
+type passOutcome int
+
+const (
+	passInconclusive passOutcome = iota
+	passReachable
+	passUnreachable
+)
+
+// giveUpAndDrain exits the process after the connector has run out of ways to
+// recover on its own.
+//
+// The connector is the data path for the Services it hosts, so staying alive
+// looks like success from the outside — traffic keeps flowing to whatever
+// backends were last observed — while the connector has in fact stopped
+// tracking reality. That is worse than being dead: a task that exits is
+// restarted by Nomad's restart stanza, and a failure that is visible in
+// `nomad alloc status` and the connector's metrics is one an operator can act
+// on. So drain what is in flight, then exit non-zero and let the supervisor do
+// its job.
+func giveUpAndDrain(rec *reconciler, hc *health, grace time.Duration, cause error) int {
+	ctx := context.Background()
+
+	// The failure itself was logged, with its own advice, by the pass that hit
+	// it; this line only has to explain the decision to exit.
+	const heartbeats = "If this keeps happening, check whether the Nomad client is losing contact with its servers — a client whose control-plane traffic rides the same interface as Tailscale goes down whenever that interface is restarted."
+
+	msg := fmt.Sprintf("exiting: %s could not reach Nomad, so this allocation can no longer be trusted to track the cluster",
+		plural(hc.snapshot().Reconcile.ConsecutiveFailures, "reconcile", "consecutive reconciles"))
+	advice := []string{
+		"A connector that cannot read Nomad keeps proxying to the backends it last saw, so it must not stay up quietly; the task's restart stanza replaces it with one that can.",
+		heartbeats,
+		"Tune the budget with -max-reconcile-failures (0 disables this exit entirely) and -failure-retry-interval.",
+	}
+	if errors.Is(cause, errIdentityRejected) {
+		msg = "exiting: Nomad has invalidated this allocation's workload identity, which only a replacement allocation can restore"
+		advice = []string{
+			"A workload identity belongs to the allocation, so restarting the task reuses the same dead token; Nomad schedules a replacement allocation once the client is back in contact with its servers. Exiting stops this connector advertising a frozen view of the world until then.",
+			heartbeats,
+		}
+	}
+	logf(ctx, levelError, "%s", display(humane.New(msg, advice...)))
+	rec.shutdown(ctx, grace)
+	return 1
 }
 
 // resolveNomadAddr picks the Nomad API address: explicit flag, then

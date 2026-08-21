@@ -332,7 +332,11 @@ ones to finish.
 | `-ts-hostname` | `nomad-tailscale-connector` | Tailnet device name. |
 | `-ts-tags` | none | ACL tags to advertise (usually conferred by the tagged auth key instead). |
 | `-dry-run` | off | Log what would be published without joining the tailnet. |
-| `-once` | off | Single reconcile pass, then drain and exit — handy with `-dry-run`. |
+| `-once` | off | Single reconcile pass, then drain and exit — handy with `-dry-run`. Exits non-zero if the pass could not reach Nomad. |
+| `-health-addr` | `$CONNECTOR_HEALTH_ADDR`, else `$NOMAD_ADDR_health`, else disabled | Address for the `/health` and `/ready` endpoints; `off` disables them. |
+| `-unhealthy-reconcile-failures` | `3` | Consecutive failed reconciles before `/health` answers `503`; `0` keeps it always healthy. |
+| `-max-reconcile-failures` | `5` | Consecutive failed reconciles before exiting non-zero so the restart stanza fires; `0` never exits. |
+| `-failure-retry-interval` | `15s` | How soon to retry after a failed reconcile; doubles up to the smaller of a minute and `-interval`, never dropping below this value. |
 
 ### Capacity planning
 
@@ -382,7 +386,9 @@ stream reconnects or malformed events, and every `-interval` to recover from a
 truncated Nomad event backlog.
 - **Metrics** cover reconcile passes and duration, active/draining endpoint
   gauges, publish/withdraw/backend-move counts, publish failures, Nomad API
-  request duration, and event-stream connectivity (`connector.*`).
+  request duration, event-stream connectivity, and the health signals below —
+  `connector.reconcile.consecutive_failures`, `connector.health.healthy`, and
+  `connector.health.ready` (`connector.*`).
 - **Logs** are the same lines you see on the console, bridged to OTLP with
   severity and — when emitted inside a reconcile — the trace and span IDs, so a
   log line links back to the pass that produced it. Console output is
@@ -399,6 +405,103 @@ is also where you can pin `host.name`/`host.id` to the Nomad node via
 `OTEL_RESOURCE_ATTRIBUTES = "host.name=${node.unique.name},host.id=${node.unique.id}"`
 (operator-supplied resource attributes override the auto-detected host name).
 
+## Staying healthy
+
+The connector is the data path for the Services it hosts, which makes "the
+process is running" a poor proxy for "the connector is working". Its worst
+failure mode is not crashing — it is carrying on: still accepting tailnet
+connections, still proxying them to whatever backends it last observed, while
+it has quietly lost the ability to read Nomad and can no longer notice that
+those backends have moved or gone away.
+
+The trigger for that is usually not the connector at all. When a Nomad client
+misses its heartbeats — say its control-plane traffic rides an interface that
+gets restarted underneath it — the servers mark the node down and every
+allocation on it terminal. Nomad then refuses those allocations' workload
+identity tokens, so every subsequent API call from the connector is rejected,
+even though the process is alive and well.
+
+Three mechanisms cover this:
+
+**A health endpoint.** With `-health-addr` set, the connector serves two
+plain-HTTP endpoints (never on the tailnet — they have to stay reachable
+precisely when the tailnet is what broke):
+
+| Path | `200` when | `503` when |
+|------|-----------|-----------|
+| `/health` | the connector's view of Nomad can still be trusted | `-unhealthy-reconcile-failures` reconciles in a row failed to reach Nomad |
+| `/ready` | the first authoritative reconcile has completed | still starting up |
+
+Both return the same JSON report — status, the reasons behind it, the last
+reconcile error, endpoint counts, and event-stream state — so `curl` during an
+incident answers "what does this connector think is wrong?" directly:
+
+```console
+$ curl -s localhost:9797/health
+{
+  "status": "unhealthy",
+  "ready": true,
+  "reasons": [
+    "3 consecutive reconciles could not reach Nomad",
+    "the Nomad event stream is disconnected"
+  ],
+  "reconcile": {
+    "last_success": "2026-08-21T04:00:22Z",
+    "last_error": "GET /v1/services: 403 Forbidden: error authenticating built API request: error=\"allocation is terminal\"",
+    "seconds_since_success": 47.3,
+    "consecutive_failures": 3,
+    "unhealthy_after": 3,
+    "fatal_after": 5
+  },
+  "endpoints": { "desired": 20, "active": 17, "draining": 0, "publish_failures": 0 },
+  "event_stream": { "up": false, "reconnects": 4 }
+}
+```
+
+The bundled job allocates a `health` port, registers a Nomad service check
+against `/health`, and attaches `check_restart` to it, so a connector that goes
+unhealthy for ~45s is restarted.
+
+**A failure budget.** After `-max-reconcile-failures` consecutive failed
+reconciles the connector drains its endpoints and exits non-zero, so the task's
+`restart` stanza recovers it. This is the backstop for deployments with no
+health check configured. A failed reconcile also schedules its own retry
+(`-failure-retry-interval`, doubling up to a minute) rather than waiting out
+the full `-interval`, so a connector that has lost sight of Nomad is actively
+trying to get it back. The backoff is capped at `-interval` when that is
+shorter than a minute — beyond that the regular repair pass is already
+retrying sooner — but never below `-failure-retry-interval` itself, so a short
+`-interval` cannot quietly poll a failing agent harder than you asked for.
+
+Set either threshold to `0` to disable that behaviour.
+
+**Recognising a dead identity.** A Nomad `403` whose body says the allocation
+is terminal is not something retrying can fix, so the connector treats it as
+immediately fatal rather than spending its budget on a foregone conclusion.
+Ordinary ACL denials — which an operator *can* fix in place, without replacing
+the allocation — keep their existing advice and stay recoverable.
+
+Be clear about what exiting buys you here: a workload identity belongs to the
+*allocation*, so restarting the task reuses the same dead token. Only a
+replacement allocation gets a fresh one, and Nomad schedules that once the
+client is back in contact with its servers. What the connector controls is
+everything up to that point — it stops advertising a frozen view of the world,
+and the failure shows up in `nomad alloc status`, the logs, and
+`connector.health.healthy` instead of being five hours of silence.
+
+A single missed reconcile is reported (`"status": "degraded"`) but does not
+fail the check: the connector is still proxying correctly from a slightly stale
+view, and restarting it would drop live connections for nothing. Likewise a
+dropped event stream on its own is a reason, not a failure — periodic
+authoritative repairs still converge state without it.
+
+> **Fix the cause too.** These mechanisms make the connector recover; they do
+> not stop the node from going down. If your Nomad clients reach their servers
+> over the same interface as Tailscale, restarting Tailscale takes the node
+> with it. Give the Nomad client a path to its servers that does not depend on
+> Tailscale, or raise the servers' `heartbeat_grace` past your longest expected
+> link flap.
+
 ## Behaviour notes
 
 - **The connector is the data path.** Service traffic flows tailnet →
@@ -411,8 +514,9 @@ is also where you can pin `host.name`/`host.id` to the Nomad node via
   backend, so if a service has several allocations on the same node only the
   newest is published (with a warning). Multiple allocations across
   *different* nodes are the supported HA pattern.
-- **Health checks are not consulted (yet).** A registered service is
-  published whether or not its checks pass.
+- **Backend health checks are not consulted (yet).** A registered service is
+  published whether or not *its* checks pass. (This is separate from the
+  connector's own `/health` endpoint — see "Staying healthy".)
 - Failed publishes (e.g. a Service not yet approved) are logged and retried
   on the next reconcile pass.
 
@@ -435,6 +539,11 @@ nomad action -job tailscale-connector -group connector -task connector dry-run
 /path/to/nomad-tailscale-connector -once -dry-run \
   -nomad-addr=http://127.0.0.1:4646 \
   -node-id="$(nomad node status -self -json | jq -r .ID)"
+
+# What does the connector itself think is wrong? (the bundled job serves this
+# on the allocated "health" port; the check status is in `nomad alloc status`)
+nomad alloc exec -job tailscale-connector \
+  wget -qO- "http://${NOMAD_ADDR_health}/health"
 ```
 
 - **`event stream disconnected (EOF)` repeating, and nothing publishes** —
@@ -472,6 +581,21 @@ nomad action -job tailscale-connector -group connector -task connector dry-run
 - **Nothing happens on service changes** — the event stream may be unable to
   connect (check connector logs); its reconnect and the periodic authoritative
   repair restore cached state.
+- **`exiting: Nomad has invalidated this allocation's workload identity`** —
+  the node missed its heartbeats and the servers marked every allocation on it
+  terminal, so this one's identity token will never be accepted again. The
+  connector exits and Nomad replaces it; that is the intended recovery. The
+  thing to fix is upstream — see "Staying healthy" for why a Nomad client whose
+  control plane rides your Tailscale interface goes down whenever that
+  interface is restarted.
+- **`exiting: N consecutive reconciles could not reach Nomad`** — the failure
+  budget ran out. The reconcile failures logged just above it carry the real
+  cause and its hints; raise `-max-reconcile-failures` (or set it to `0`) if
+  your agent is legitimately unavailable for longer than the budget allows.
+- **The health check is flapping** — `/health` only fails after
+  `-unhealthy-reconcile-failures` consecutive failures, so flapping means
+  reconciles genuinely are. `curl` the endpoint: `reconcile.last_error` names
+  the cause, and `reasons` summarises it.
 
 ## Building
 
