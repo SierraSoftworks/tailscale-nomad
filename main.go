@@ -68,7 +68,7 @@ func run() int {
 		healthAddr     = flag.String("health-addr", "", `address for the HTTP health endpoint, e.g. 127.0.0.1:9797 (default: $CONNECTOR_HEALTH_ADDR, else the Nomad-allocated "health" port, else disabled; "off" disables it)`)
 		unhealthyAfter = flag.Int("unhealthy-reconcile-failures", 3, "consecutive failed reconciles before /health reports unhealthy; 0 keeps it always healthy")
 		fatalAfter     = flag.Int("max-reconcile-failures", 5, "consecutive failed reconciles before exiting non-zero so the task's restart stanza can recover; 0 never exits")
-		retryInterval  = flag.Duration("failure-retry-interval", 15*time.Second, "how soon to retry after a failed reconcile; doubles up to a minute (or -interval, if shorter)")
+		retryInterval  = flag.Duration("failure-retry-interval", 15*time.Second, "how soon to retry after a failed reconcile; doubles up to the smaller of a minute and -interval, never dropping below this value")
 		showVersion    = flag.Bool("version", false, "print the connector version and exit")
 	)
 	flag.Parse()
@@ -314,6 +314,12 @@ func run() int {
 	// repair interval: the failure budget is only meaningful if failures can
 	// accumulate at a useful rate, and a connector that has lost sight of
 	// Nomad should be trying to get it back.
+	// Cap the backoff at a minute, or at -interval when that is shorter —
+	// past that point the regular repair pass is already retrying sooner and
+	// the extra timer earns nothing. The floor keeps the cap from dropping
+	// below the operator's stated minimum spacing: -failure-retry-interval is
+	// how often they are willing to have a failing agent polled, so a shorter
+	// -interval must not quietly override it.
 	retryCap := time.Minute
 	if *interval < retryCap {
 		retryCap = *interval

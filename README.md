@@ -336,7 +336,7 @@ ones to finish.
 | `-health-addr` | `$CONNECTOR_HEALTH_ADDR`, else `$NOMAD_ADDR_health`, else disabled | Address for the `/health` and `/ready` endpoints; `off` disables them. |
 | `-unhealthy-reconcile-failures` | `3` | Consecutive failed reconciles before `/health` answers `503`; `0` keeps it always healthy. |
 | `-max-reconcile-failures` | `5` | Consecutive failed reconciles before exiting non-zero so the restart stanza fires; `0` never exits. |
-| `-failure-retry-interval` | `15s` | How soon to retry after a failed reconcile; doubles up to a minute (or `-interval`, if shorter). |
+| `-failure-retry-interval` | `15s` | How soon to retry after a failed reconcile; doubles up to the smaller of a minute and `-interval`, never dropping below this value. |
 
 ### Capacity planning
 
@@ -468,7 +468,10 @@ reconciles the connector drains its endpoints and exits non-zero, so the task's
 health check configured. A failed reconcile also schedules its own retry
 (`-failure-retry-interval`, doubling up to a minute) rather than waiting out
 the full `-interval`, so a connector that has lost sight of Nomad is actively
-trying to get it back.
+trying to get it back. The backoff is capped at `-interval` when that is
+shorter than a minute — beyond that the regular repair pass is already
+retrying sooner — but never below `-failure-retry-interval` itself, so a short
+`-interval` cannot quietly poll a failing agent harder than you asked for.
 
 Set either threshold to `0` to disable that behaviour.
 
