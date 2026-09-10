@@ -71,7 +71,7 @@ func hasEnableTag(tags []string, prefix string) bool {
 //	tailscale.tls-terminated-tcp=<port> TLS-terminated TCP endpoint
 //	tailscale.path=<path>              mount path for http/https handlers
 //	tailscale.scope=<scope>            node, datacenter (default), or global
-//	tailscale.publish-cert=true        publish the Service's TLS certificate to a Nomad variable
+//	tailscale.publish-cert=true|false  publish the Service's TLS certificate to a Nomad variable
 //	tailscale.max-connections=<count>   simultaneous connections per endpoint
 //	tailscale.read-header-timeout=<duration>
 //	tailscale.idle-timeout=<duration>

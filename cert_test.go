@@ -246,7 +246,7 @@ func TestLeafNotAfter(t *testing.T) {
 	// tsnet returns the leaf first, followed by the chain; only the leaf
 	// counts, and non-certificate blocks ahead of it are skipped.
 	chain := append([]byte("-----BEGIN JUNK-----\nAAAA\n-----END JUNK-----\n"), certPEM...)
-	_, issuerPEM := testCertPair(t, "issuer", want.Add(365*24*time.Hour))
+	issuerPEM, _ := testCertPair(t, "issuer", want.Add(365*24*time.Hour))
 	chain = append(chain, issuerPEM...)
 
 	got, err := leafNotAfter(chain)
