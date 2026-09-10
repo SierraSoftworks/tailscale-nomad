@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,17 +82,36 @@ func newNomadClient(addr, token string) *nomadClient {
 	return &nomadClient{http: client, base: base, addr: addr, token: token}
 }
 
-func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*http.Response, error) {
+// nomadAPIError is a non-2xx answer from the Nomad API. Callers that expect
+// particular statuses (a 404 for a missing variable, a 409 for a failed
+// check-and-set) pick them out with errors.As; everything else is reported
+// as-is.
+type nomadAPIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *nomadAPIError) Error() string {
+	return fmt.Sprintf("%s %s: %s: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+func (c *nomadClient) do(ctx context.Context, method, path string, query url.Values, body io.Reader) (*http.Response, error) {
 	u := c.base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
 		return nil, err
 	}
 	if c.token != "" {
 		req.Header.Set("X-Nomad-Token", c.token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -98,29 +119,40 @@ func (c *nomadClient) do(ctx context.Context, path string, query url.Values) (*h
 			"Check that a Nomad agent is listening at the configured address: the -nomad-addr flag, $NOMAD_ADDR, or (inside a Nomad task) the api.sock task API socket.",
 		)
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
-		msg := fmt.Sprintf("GET %s: %s: %s", path, resp.Status, strings.TrimSpace(string(body)))
+		apiErr := &nomadAPIError{Method: method, Path: path, StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(raw))}
 		if resp.StatusCode == http.StatusForbidden {
-			if rejectsIdentity(string(body)) {
-				return nil, humane.Wrap(errIdentityRejected, msg,
+			if rejectsIdentity(apiErr.Body) {
+				return nil, humane.Wrap(errIdentityRejected, apiErr.Error(),
 					"Nomad marks an allocation terminal when its node misses heartbeats, and then refuses that allocation's identity token forever — restarting the task reuses the same dead identity, so only a replacement allocation recovers it.",
 					"Check whether the Nomad client lost contact with its servers: a node whose control-plane traffic rides the same interface as your VPN goes down whenever that interface does.",
 					"Give the Nomad client a path to its servers that does not depend on Tailscale, or raise the servers' heartbeat_grace, so a brief link flap cannot terminate every allocation on the node.",
 				)
 			}
-			return nil, humane.New(msg,
+			if strings.HasPrefix(path, "/v1/var/") {
+				return nil, humane.Wrap(apiErr, "Nomad refused access to the variable",
+					`Publishing certificates needs a variables block in the connector's ACL policy: namespace "*" { variables { path "nomad/jobs/*/tls" { capabilities = ["read", "write"] } } } — see "Publishing certificates to backends" in the README.`,
+				)
+			}
+			return nil, humane.Wrap(apiErr, "Nomad refused the request",
 				"With ACLs enabled, the connector's workload identity needs a policy granting read-job across namespaces (plus agent:read when the node ID is auto-detected).",
 				`Apply it with: nomad acl policy apply -namespace default -job tailscale-connector tailscale-connector policy.hcl — see "Grant API access" in the README.`,
 			)
 		}
-		return nil, errors.New(msg)
+		return nil, apiErr
 	}
 	return resp, nil
 }
 
 func (c *nomadClient) get(ctx context.Context, path string, query url.Values, v any) error {
+	return c.request(ctx, http.MethodGet, path, query, nil, v)
+}
+
+// request performs one short-lived API call, JSON-encoding in (when non-nil)
+// and decoding the response into out (when non-nil).
+func (c *nomadClient) request(ctx context.Context, method, path string, query url.Values, in, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -128,9 +160,9 @@ func (c *nomadClient) get(ctx context.Context, path string, query url.Values, v 
 	// name uses a templated route so the service-name path segment doesn't
 	// explode span cardinality.
 	route := nomadRoute(path)
-	ctx, span := tracer.Start(ctx, "GET "+route, trace.WithSpanKind(trace.SpanKindClient),
+	ctx, span := tracer.Start(ctx, method+" "+route, trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
-			attribute.String("http.request.method", "GET"),
+			attribute.String("http.request.method", method),
 			attribute.String("url.path", path),
 			attribute.String("http.route", route),
 			attribute.String("server.address", c.addr),
@@ -139,14 +171,29 @@ func (c *nomadClient) get(ctx context.Context, path string, query url.Values, v 
 
 	started := time.Now()
 	err := func() error {
-		resp, err := c.do(ctx, path, query)
+		var body io.Reader
+		if in != nil {
+			encoded, err := json.Marshal(in)
+			if err != nil {
+				return err
+			}
+			body = bytes.NewReader(encoded)
+		}
+		resp, err := c.do(ctx, method, path, query, body)
 		if err != nil {
+			var apiErr *nomadAPIError
+			if errors.As(err, &apiErr) {
+				span.SetAttributes(attribute.Int("http.response.status_code", apiErr.StatusCode))
+			}
 			return err
 		}
 		defer resp.Body.Close()
 		span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
-		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-			return humane.Wrap(err, "parsing the Nomad API response for GET "+path,
+		if out == nil {
+			return nil
+		}
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return humane.Wrap(err, fmt.Sprintf("parsing the Nomad API response for %s %s", method, path),
 				"The configured address may not be a Nomad agent's HTTP API; check the -nomad-addr flag and $NOMAD_ADDR.",
 			)
 		}
@@ -155,6 +202,7 @@ func (c *nomadClient) get(ctx context.Context, path string, query url.Values, v 
 
 	mNomadRequestDuration.Record(ctx, time.Since(started).Seconds(), metric.WithAttributes(
 		attribute.String("http.route", route),
+		attribute.String("http.request.method", method),
 		attribute.Bool("error", err != nil),
 	))
 	if err != nil {
@@ -174,6 +222,10 @@ func nomadRoute(path string) string {
 		return "/v1/service/:name"
 	case path == "/v1/agent/self":
 		return "/v1/agent/self"
+	case strings.HasPrefix(path, "/v1/allocation/"):
+		return "/v1/allocation/:id"
+	case strings.HasPrefix(path, "/v1/var/"):
+		return "/v1/var/:path"
 	default:
 		return path
 	}
@@ -246,6 +298,110 @@ func (c *nomadClient) getService(ctx context.Context, namespace, name string) ([
 	var out []serviceRegistration
 	err := c.get(ctx, "/v1/service/"+url.PathEscape(name), url.Values{"namespace": {namespace}}, &out)
 	return out, err
+}
+
+// allocation is the subset of GET /v1/allocation/:id the connector needs to
+// attribute a service registration to the group or task that declared it: the
+// allocation's task group, and the job version it is running.
+type allocation struct {
+	ID        string
+	Namespace string
+	JobID     string
+	TaskGroup string
+	Job       *jobSpec
+}
+
+type jobSpec struct {
+	ID         string
+	TaskGroups []jobTaskGroup
+}
+
+type jobTaskGroup struct {
+	Name     string
+	Services []jobService
+	Tasks    []jobTask
+}
+
+type jobTask struct {
+	Name     string
+	Services []jobService
+}
+
+type jobService struct {
+	Name     string
+	Provider string
+	Tags     []string
+}
+
+func (c *nomadClient) getAllocation(ctx context.Context, namespace, id string) (*allocation, error) {
+	var out allocation
+	if err := c.get(ctx, "/v1/allocation/"+url.PathEscape(id), url.Values{"namespace": {namespace}}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// nomadVariable is a Nomad variable as read from and written to /v1/var/:path.
+type nomadVariable struct {
+	Namespace   string
+	Path        string
+	Items       map[string]string
+	CreateIndex uint64
+	ModifyIndex uint64
+}
+
+// errVariableConflict reports a check-and-set write that lost to a concurrent
+// writer; the caller re-reads and decides again on its next pass.
+var errVariableConflict = errors.New("the variable was modified concurrently")
+
+// getVariable reads one variable, returning nil (and no error) when it does
+// not exist.
+func (c *nomadClient) getVariable(ctx context.Context, namespace, path string) (*nomadVariable, error) {
+	var out nomadVariable
+	err := c.get(ctx, "/v1/var/"+escapeVariablePath(path), url.Values{"namespace": {namespace}}, &out)
+	if err != nil {
+		var apiErr *nomadAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
+// putVariable writes a variable with check-and-set semantics: cas is the
+// ModifyIndex the caller last read, or zero to insist the variable does not
+// exist yet. A lost race is reported as errVariableConflict.
+func (c *nomadClient) putVariable(ctx context.Context, v nomadVariable, cas uint64) (*nomadVariable, error) {
+	query := url.Values{
+		"namespace": {v.Namespace},
+		"cas":       {strconv.FormatUint(cas, 10)},
+	}
+	body := struct {
+		Namespace string
+		Path      string
+		Items     map[string]string
+	}{v.Namespace, v.Path, v.Items}
+	var out nomadVariable
+	err := c.request(ctx, http.MethodPut, "/v1/var/"+escapeVariablePath(v.Path), query, body, &out)
+	if err != nil {
+		var apiErr *nomadAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+			return nil, fmt.Errorf("%w (check-and-set index %d)", errVariableConflict, cas)
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
+// escapeVariablePath escapes each segment of a variable path while keeping the
+// separators, since the path is part of the URL.
+func escapeVariablePath(path string) string {
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		segments[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segments, "/")
 }
 
 func (c *nomadClient) localIdentity(ctx context.Context) (string, string, error) {
@@ -322,7 +478,7 @@ func (c *nomadClient) streamEvents(ctx context.Context, updates chan<- serviceEv
 		"topic":     {"Service"},
 		"namespace": {"*"},
 	}
-	resp, err := c.do(ctx, "/v1/event/stream", query)
+	resp, err := c.do(ctx, http.MethodGet, "/v1/event/stream", query, nil)
 	if err != nil {
 		return err
 	}

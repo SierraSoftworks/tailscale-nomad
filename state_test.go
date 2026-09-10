@@ -38,7 +38,7 @@ func TestDesiredFromStatePrefersLocalBackend(t *testing.T) {
 		registrationKey("default", "same-dc"): {ID: "same-dc", ServiceName: "web", Namespace: "default", NodeID: "node-2", Datacenter: "dc-1", Tags: tags, Address: "10.0.0.2", Port: 8002, CreateIndex: 2},
 		registrationKey("default", "remote"):  {ID: "remote", ServiceName: "web", Namespace: "default", NodeID: "node-3", Datacenter: "dc-2", Tags: tags, Address: "10.0.0.3", Port: 8003, CreateIndex: 3},
 	}
-	desired := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
+	desired, _ := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
 	if len(desired) != 1 || desired[0].Backend != "10.0.0.1:8001" {
 		t.Fatalf("desired = %+v, want node-local backend", desired)
 	}
@@ -50,7 +50,7 @@ func TestDesiredFromStatePrefersDatacenterBackendForGlobalScope(t *testing.T) {
 		registrationKey("default", "same-dc"): {ID: "same-dc", ServiceName: "web", Namespace: "default", NodeID: "node-2", Datacenter: "dc-1", Tags: tags, Address: "10.0.0.2", Port: 8002, CreateIndex: 1},
 		registrationKey("default", "remote"):  {ID: "remote", ServiceName: "web", Namespace: "default", NodeID: "node-3", Datacenter: "dc-2", Tags: tags, Address: "10.0.0.3", Port: 8003, CreateIndex: 2},
 	}
-	desired := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
+	desired, _ := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
 	if len(desired) != 1 || desired[0].Backend != "10.0.0.2:8002" {
 		t.Fatalf("desired = %+v, want datacenter-local backend", desired)
 	}
@@ -63,7 +63,7 @@ func TestDesiredFromStateSelectsNewestRegistrationInScope(t *testing.T) {
 		registrationKey("default", "new"):    {ID: "new", ServiceName: "web", Namespace: "default", NodeID: "node-2", Datacenter: "dc-1", Tags: tags, Address: "10.0.0.2", Port: 8002, CreateIndex: 2},
 		registrationKey("default", "remote"): {ID: "remote", ServiceName: "web", Namespace: "default", NodeID: "node-3", Datacenter: "dc-2", Tags: tags, Address: "10.0.0.3", Port: 8003, CreateIndex: 3},
 	}
-	desired := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
+	desired, _ := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
 	if len(desired) != 1 || desired[0].Backend != "10.0.0.2:8002" {
 		t.Fatalf("desired = %+v, want newest dc-1 backend", desired)
 	}

@@ -207,3 +207,28 @@ func TestParseTagsZeroDisablesProxyLimits(t *testing.T) {
 		t.Fatalf("proxy config = %+v, want all limits disabled", got)
 	}
 }
+
+func TestParseTagsPublishCert(t *testing.T) {
+	tests := []struct {
+		name      string
+		tags      []string
+		want      bool
+		wantWarns int
+	}{
+		{"absent", []string{"tailscale.enable=true"}, false, 0},
+		{"true", []string{"tailscale.enable=true", "tailscale.publish-cert=true", "tailscale.tcp=8089"}, true, 0},
+		{"false", []string{"tailscale.enable=true", "tailscale.publish-cert=false"}, false, 0},
+		{"invalid", []string{"tailscale.enable=true", "tailscale.publish-cert=yes"}, false, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, warns := parseTags("tailscale", "ots", tt.tags, proxyConfig{})
+			if spec.PublishCert != tt.want {
+				t.Fatalf("PublishCert = %v, want %v", spec.PublishCert, tt.want)
+			}
+			if len(warns) != tt.wantWarns {
+				t.Fatalf("warnings = %v, want %d", warns, tt.wantWarns)
+			}
+		})
+	}
+}
