@@ -149,6 +149,11 @@ agent {
 }
 ```
 
+Publishing certificates (`tailscale.publish-cert=true`) additionally needs
+read/write access to the jobs' own variables — see [Publishing certificates
+to backends](#publishing-certificates-to-backends) for the `variables` block
+to add.
+
 ```sh
 nomad acl policy apply \
   -namespace default -job tailscale-connector \
@@ -227,6 +232,7 @@ group "app" {
 | `tailscale.http=<port>` | Plain-HTTP endpoint. |
 | `tailscale.tcp=<port>` | TCP passthrough endpoint. |
 | `tailscale.tls-terminated-tcp=<port>` | TCP endpoint with TLS terminated by tsnet. |
+| `tailscale.publish-cert=true` | Publish the Service's TLS certificate (issued by Tailscale for `<service>.<tailnet>.ts.net`) into the workload's own Nomad variable as `tailscale_cert`/`tailscale_key`, for backends that terminate TLS themselves. Works with any endpoint kind. See [Publishing certificates to backends](#publishing-certificates-to-backends). |
 | `tailscale.path=<path>` | Mount path for http/https endpoints — requests outside it get a 404; the path is forwarded to the backend unchanged. |
 | `tailscale.max-connections=<count>` | Maximum simultaneous client connections per endpoint. Defaults to `-max-connections`; `0` disables the limit. |
 | `tailscale.read-header-timeout=<duration>` | Maximum time to read HTTP request headers. Default `10s`; `0` disables it. |
@@ -316,6 +322,188 @@ Services. Existing TCP connections are not migrated between hosts after an
 abrupt failure; graceful draining stops new connections while allowing current
 ones to finish.
 
+## Publishing certificates to backends
+
+tsnet terminates TLS for `https` and `tls-terminated-tcp` endpoints, so most
+backends never see a certificate. Some must terminate TLS themselves — a
+server doing mutual TLS against its own client CA, say, exposed here as a raw
+`tailscale.tcp` passthrough — and should still present the publicly trusted
+certificate Tailscale issues for the Service's MagicDNS name. Tag the service
+with `tailscale.publish-cert=true` and the connector hosting it writes that
+certificate into the job's own Nomad variable, where a `template` block can
+pick it up with no extra ACL configuration on the job:
+
+```hcl
+group "ots" {
+  service {
+    name     = "opentakserver"
+    port     = "https"
+    provider = "nomad"
+    tags = [
+      "tailscale.enable=true",
+      "tailscale.service=opentakserver",
+      "tailscale.tcp=8089",              # mutual TLS, terminated by the backend
+      "tailscale.tcp=8443",
+      "tailscale.publish-cert=true",
+    ]
+  }
+  task "server" { ... }
+}
+```
+
+### Where the certificate goes
+
+The certificate is merged into the variable Nomad already reserves for the
+workload — the one a task's default workload identity can read without any
+policy — in the service's namespace. The path is not configurable; it follows
+where the `service` block lives:
+
+| Service declared in | Variable path |
+|---------------------|---------------|
+| a task              | `nomad/jobs/<job>/<group>/<task>` |
+| a group             | `nomad/jobs/<job>/<group>` |
+
+Nomad's registration carries no group or task name, so the connector reads
+the allocation and finds the service in the job version it runs — by name,
+or failing that (a name built with `${...}` interpolation) by the
+`publish-cert` tag. A service it cannot attribute to exactly one place is
+logged and skipped rather than guessed.
+
+The connector owns four items in that variable and leaves every other item
+alone, so the variable can keep holding the job's own secrets:
+
+| Item | Contents |
+|------|----------|
+| `tailscale_domain` | the FQDN the certificate is issued for |
+| `tailscale_cert` | the PEM chain, leaf first, as tsnet returns it |
+| `tailscale_key` | the PEM private key |
+| `tailscale_not_after` | the leaf's expiry, RFC 3339 |
+
+Writes use Nomad's check-and-set so two writers cannot silently clobber each
+other, and only happen when the stored items differ. Certificates are fetched
+through the connector's own tsnet node with a minimum remaining validity of
+`-cert-renew-before` (30 days), so tsnet renews them well before expiry; the
+connector re-checks on every reconcile and every `-cert-refresh-interval`
+(hourly) regardless, relying on tsnet's on-disk cache to keep that cheap.
+
+Only the connector on the node hosting the service publishes. When several
+nodes host one Service each obtains its own certificate for the same name;
+whichever published first stays in place until it enters the renewal window,
+and the others leave it alone so the backend is not restarted every pass.
+Anything stored that is not a usable certificate for the domain — missing,
+unparseable, a key that does not match, or one due for renewal — is replaced.
+
+> **`nomad var put` replaces the whole variable.** If you manage the job's
+> variable by hand, the connector's items disappear with each `put` and come
+> back on the connector's next pass (within the hour). Use `nomad var get`
+> and edit in place, or keep the job's own secrets in a separate variable, to
+> avoid the gap.
+
+### ACL for the connector
+
+With ACLs enabled, add a `variables` block to the connector's policy from
+[step 3](#3-grant-api-access-acl-enabled-clusters-only). The connector reads
+the variable to merge and writes it back, so it needs both capabilities:
+
+```hcl
+namespace "*" {
+  capabilities = ["read-job"]
+
+  variables {
+    path "nomad/jobs/*" {
+      capabilities = ["read", "write"]
+    }
+  }
+}
+```
+
+Nomad matches variable paths with a glob in which `*` spans `/` separators,
+so `nomad/jobs/*` covers both group- and task-level paths. Be aware of what
+that grants: the connector can then read and write every job's variable in
+every namespace, secrets included. To keep the blast radius small, list only
+the jobs that publish certificates instead:
+
+```hcl
+namespace "default" {
+  variables {
+    path "nomad/jobs/opentakserver/*" {
+      capabilities = ["read", "write"]
+    }
+  }
+}
+```
+
+The consuming job needs nothing: Nomad grants a task's identity read access
+to `nomad/jobs/<job>/<group>/<task>` and `nomad/jobs/<job>/<group>` (and the
+job- and root-level paths above them) out of the box. Clusters without ACLs
+need nothing on either side.
+
+### Consuming the certificate
+
+`nomadVar` blocks rendering until its path exists. If the job already keeps a
+variable at that path — its own secrets, say — the certificate items simply
+appear in it once published, and the template can read them directly:
+
+```hcl
+task "server" {
+  template {
+    data        = <<-EOT
+      {{ with nomadVar "nomad/jobs/opentakserver/ots/server" }}{{ .tailscale_cert }}{{ end }}
+    EOT
+    destination = "secrets/tls/cert.pem"
+    change_mode = "restart"   # or "signal" if the server reloads on SIGHUP
+  }
+
+  template {
+    data        = <<-EOT
+      {{ with nomadVar "nomad/jobs/opentakserver/ots/server" }}{{ .tailscale_key }}{{ end }}
+    EOT
+    destination = "secrets/tls/key.pem"
+    perms       = "0600"
+    change_mode = "restart"
+  }
+}
+```
+
+If nothing else lives at that path there is a chicken-and-egg on first
+deployment: the connector publishes for *running* services, so the backend
+has to start before the variable can exist — but `nomadVar` would hold the
+task at startup forever waiting for it. Guard it with `nomadVarList`, which
+returns an empty list instead of blocking, and let `change_mode` bring the
+certificate in once it lands:
+
+```hcl
+template {
+  data        = <<-EOT
+    {{- range nomadVarList "nomad/jobs/opentakserver/ots/server" }}
+    {{- if eq .Path "nomad/jobs/opentakserver/ots/server" }}
+    {{- with nomadVar .Path }}{{ .tailscale_cert }}{{ end }}
+    {{- end }}
+    {{- end }}
+  EOT
+  destination = "secrets/tls/cert.pem"
+  change_mode = "restart"
+}
+```
+
+Either way the files render empty until the certificate is published (have
+the backend fall back to a self-signed certificate, or accept a restart);
+Nomad then re-renders them and restarts the task with the real certificate,
+and does so again on every renewal. The `-dry-run` smoke test prints the
+domain and path each tagged service would publish to, without writing
+anything.
+
+### Status
+
+Each published certificate appears in the `/health` report under
+`certificates` with its `path`, `domain`, `state` (`published`, `current`,
+`failed`, or `dry-run`), `not_after`, `last_published`, and `last_error`. A
+failed publication is listed in `reasons` but never makes the connector
+unhealthy: the service keeps being proxied, and the next pass retries. The
+same is available as the `connector.certificates.published`,
+`connector.certificates.publish_failures`, and
+`connector.certificates.tracked` metrics.
+
 ## Connector flags
 
 | Flag | Default | Purpose |
@@ -337,6 +525,8 @@ ones to finish.
 | `-unhealthy-reconcile-failures` | `3` | Consecutive failed reconciles before `/health` answers `503`; `0` keeps it always healthy. |
 | `-max-reconcile-failures` | `5` | Consecutive failed reconciles before exiting non-zero so the restart stanza fires; `0` never exits. |
 | `-failure-retry-interval` | `15s` | How soon to retry after a failed reconcile; doubles up to the smaller of a minute and `-interval`, never dropping below this value. |
+| `-cert-renew-before` | `720h` (30 days) | Renew a published Service certificate when less than this remains before it expires. |
+| `-cert-refresh-interval` | `1h` | How often published Service certificates are re-checked for renewal when nothing else changes. |
 
 ### Capacity planning
 
@@ -385,8 +575,9 @@ connector performs an authoritative full API repair at startup, after event
 stream reconnects or malformed events, and every `-interval` to recover from a
 truncated Nomad event backlog.
 - **Metrics** cover reconcile passes and duration, active/draining endpoint
-  gauges, publish/withdraw/backend-move counts, publish failures, Nomad API
-  request duration, event-stream connectivity, and the health signals below —
+  gauges, publish/withdraw/backend-move counts, publish failures, certificate
+  publications and their failures, Nomad API request duration, event-stream
+  connectivity, and the health signals below —
   `connector.reconcile.consecutive_failures`, `connector.health.healthy`, and
   `connector.health.ready` (`connector.*`).
 - **Logs** are the same lines you see on the console, bridged to OTLP with
@@ -433,8 +624,9 @@ precisely when the tailnet is what broke):
 | `/ready` | the first authoritative reconcile has completed | still starting up |
 
 Both return the same JSON report — status, the reasons behind it, the last
-reconcile error, endpoint counts, and event-stream state — so `curl` during an
-incident answers "what does this connector think is wrong?" directly:
+reconcile error, endpoint counts, event-stream state, and the state of any
+published certificates — so `curl` during an incident answers "what does this
+connector think is wrong?" directly:
 
 ```console
 $ curl -s localhost:9797/health
@@ -454,7 +646,19 @@ $ curl -s localhost:9797/health
     "fatal_after": 5
   },
   "endpoints": { "desired": 20, "active": 17, "draining": 0, "publish_failures": 0 },
-  "event_stream": { "up": false, "reconnects": 4 }
+  "event_stream": { "up": false, "reconnects": 4 },
+  "certificates": [
+    {
+      "service": "svc:opentakserver",
+      "namespace": "default",
+      "nomad_service": "opentakserver",
+      "domain": "opentakserver.example.ts.net",
+      "path": "nomad/jobs/opentakserver/ots/server",
+      "state": "current",
+      "not_after": "2026-11-03T09:12:41Z",
+      "last_published": "2026-08-05T09:14:02Z"
+    }
+  ]
 }
 ```
 
@@ -592,6 +796,16 @@ nomad alloc exec -job tailscale-connector \
   budget ran out. The reconcile failures logged just above it carry the real
   cause and its hints; raise `-max-reconcile-failures` (or set it to `0`) if
   your agent is legitimately unavailable for longer than the budget allows.
+- **`publishing svc:... certificate ...` errors** — `/health` lists the
+  failing certificate under `certificates` with the path and error. A `403`
+  on `/v1/var/...` means the connector's policy lacks the `variables` block
+  (read and write on the job's variable path);
+  "could not attribute the service" means the service block could not be
+  found once, by name or `publish-cert` tag, in the allocation's job; a
+  tailnet error usually means HTTPS certificates are not enabled for the
+  tailnet or the Service is not yet approved for this host. All of these
+  retry on the next reconcile and every `-cert-refresh-interval` without
+  affecting proxying.
 - **The health check is flapping** — `/health` only fails after
   `-unhealthy-reconcile-failures` consecutive failures, so flapping means
   reconciles genuinely are. `curl` the endpoint: `reconcile.last_error` names

@@ -64,7 +64,8 @@ type health struct {
 	passes      int64
 	failures    int64
 
-	endpoints reconcileStats
+	endpoints    reconcileStats
+	certificates []certStatus
 
 	streamUp         bool
 	streamChanged    time.Time
@@ -130,6 +131,19 @@ func (h *health) endpointsReconciled(ctx context.Context, stats reconcileStats) 
 	}
 	h.mu.Lock()
 	h.endpoints = stats
+	h.mu.Unlock()
+	h.record(ctx)
+}
+
+// certificatesReconciled records the per-certificate publication state from
+// the latest pass. A failed publication is a reason to report, not a health
+// failure: the service is still being proxied, and the next pass retries.
+func (h *health) certificatesReconciled(ctx context.Context, certs []certStatus) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.certificates = certs
 	h.mu.Unlock()
 	h.record(ctx)
 }
@@ -208,6 +222,10 @@ type healthReport struct {
 		Reconnects int64      `json:"reconnects"`
 		LastError  string     `json:"last_error,omitempty"`
 	} `json:"event_stream"`
+
+	// Certificates lists every service whose certificate this connector
+	// publishes to a Nomad variable, with the path, expiry, and last error.
+	Certificates []certStatus `json:"certificates,omitempty"`
 }
 
 // snapshot renders the current state. The status is derived here rather than
@@ -251,6 +269,8 @@ func (h *health) snapshot() healthReport {
 	r.Endpoints.Draining = h.endpoints.Draining
 	r.Endpoints.PublishFailures = h.endpoints.Failed
 
+	r.Certificates = append([]certStatus(nil), h.certificates...)
+
 	r.EventStream.Up = h.streamUp
 	r.EventStream.Reconnects = h.streamReconnects
 	r.EventStream.LastError = h.streamError
@@ -278,6 +298,15 @@ func (h *health) snapshot() healthReport {
 	}
 	if h.endpoints.Failed > 0 {
 		r.Reasons = append(r.Reasons, fmt.Sprintf("%s failed to publish", plural(h.endpoints.Failed, "endpoint", "endpoints")))
+	}
+	failedCerts := 0
+	for _, c := range h.certificates {
+		if c.State == certStateFailed {
+			failedCerts++
+		}
+	}
+	if failedCerts > 0 {
+		r.Reasons = append(r.Reasons, fmt.Sprintf("%s could not be published to a Nomad variable", plural(failedCerts, "certificate", "certificates")))
 	}
 	return r
 }

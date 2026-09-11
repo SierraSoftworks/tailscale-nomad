@@ -69,6 +69,8 @@ func run() int {
 		unhealthyAfter = flag.Int("unhealthy-reconcile-failures", 3, "consecutive failed reconciles before /health reports unhealthy; 0 keeps it always healthy")
 		fatalAfter     = flag.Int("max-reconcile-failures", 5, "consecutive failed reconciles before exiting non-zero so the task's restart stanza can recover; 0 never exits")
 		retryInterval  = flag.Duration("failure-retry-interval", 15*time.Second, "how soon to retry after a failed reconcile; doubles up to the smaller of a minute and -interval, never dropping below this value")
+		certRenew      = flag.Duration("cert-renew-before", 30*24*time.Hour, "renew a published Service certificate when less than this remains before it expires")
+		certRefresh    = flag.Duration("cert-refresh-interval", time.Hour, "how often published Service certificates are re-checked for renewal when nothing else changes")
 		showVersion    = flag.Bool("version", false, "print the connector version and exit")
 	)
 	flag.Parse()
@@ -82,6 +84,10 @@ func run() int {
 	}
 	if *retryInterval <= 0 {
 		logf(context.Background(), levelError, "-failure-retry-interval must be greater than zero")
+		return 2
+	}
+	if *certRenew < 0 || *certRefresh <= 0 {
+		logf(context.Background(), levelError, "-cert-renew-before must be zero or greater and -cert-refresh-interval greater than zero")
 		return 2
 	}
 
@@ -157,6 +163,7 @@ func run() int {
 	}
 
 	var pub publisher = dryRunPublisher{}
+	var certs certSource = dryRunCertSource{}
 	if !*dryRun {
 		if *tsDir != "" {
 			if err := os.MkdirAll(*tsDir, 0o700); err != nil {
@@ -195,19 +202,26 @@ func run() int {
 		}
 		logf(ctx, levelInfo, "joined tailnet as %s", self)
 		pub = &tsnetPublisher{srv: srv}
+		source := &tsnetCertSource{srv: srv}
+		if status != nil && status.CurrentTailnet != nil {
+			source.suffix = status.CurrentTailnet.MagicDNSSuffix
+		}
+		certs = source
 	}
 
 	rec := newReconciler(pub, *drainGrace)
+	certPub := newCertPublisher(nomad, certs, *tagPrefix, *certRenew, *dryRun)
 	proxyDefaults := defaultProxyConfig(*maxConnections)
 	state := serviceState{}
 	events := make(chan serviceEventBatch, 256)
 	go nomad.watchEvents(ctx, events)
 
 	// pass runs one reconcile as a short-lived, self-contained trace rooted
-	// here: gathering Nomad's services and converging the published endpoints
-	// become child spans of this one. trigger records what woke the pass
-	// (startup, an event-stream notification, the periodic interval, or a
-	// draining deadline) so traces and metrics can be sliced by cause.
+	// here: gathering Nomad's services, converging the published endpoints,
+	// and publishing Service certificates become child spans of this one.
+	// trigger records what woke the pass (startup, an event-stream
+	// notification, the periodic interval, a draining deadline, or the
+	// certificate refresh timer) so traces and metrics can be sliced by cause.
 	//
 	// It reports what the pass established about Nomad's reachability, and —
 	// when the connector should stop trying — the failure that ended it:
@@ -256,8 +270,9 @@ func run() int {
 			}
 		}
 		var desired []desiredEndpoint
+		var desiredCerts []desiredCert
 		if err == nil {
-			desired = desiredFromState(ctx, state, node, dc, *tagPrefix, proxyDefaults)
+			desired, desiredCerts = desiredFromState(ctx, state, node, dc, *tagPrefix, proxyDefaults)
 		}
 		if err != nil {
 			outcome = "error"
@@ -283,6 +298,9 @@ func run() int {
 			} else {
 				hc.endpointsReconciled(ctx, stats)
 			}
+			// Certificates come after the listeners so a certificate that
+			// cannot be published never delays or blocks proxying.
+			hc.certificatesReconciled(ctx, certPub.publish(ctx, desiredCerts))
 		}
 
 		span.SetAttributes(attribute.String("connector.outcome", outcome))
@@ -351,6 +369,11 @@ func run() int {
 
 	repairTimer := time.NewTimer(*interval)
 	defer repairTimer.Stop()
+	// Certificates renew on their own clock: a reconcile re-checks them, but
+	// a quiet cluster may not reconcile for a long time, and renewal must not
+	// wait for something else to change.
+	certTimer := time.NewTicker(*certRefresh)
+	defer certTimer.Stop()
 	for {
 		var deadlineTimer <-chan time.Time
 		if deadline, ok := rec.nextDeadline(); ok {
@@ -420,6 +443,8 @@ func run() int {
 		case <-repairTimer.C:
 			reach, giveUp = pass(ctx, "interval", true, nil)
 			repairTimer.Reset(*interval)
+		case <-certTimer.C:
+			reach, giveUp = pass(ctx, "certificates", false, nil)
 		}
 
 		if giveUp != nil {
@@ -582,14 +607,18 @@ func gatherState(ctx context.Context, nomad *nomadClient, tagPrefix string) (sta
 }
 
 // desiredFromState selects one reachable registration for each service and
-// translates its tags into published endpoints.
-func desiredFromState(ctx context.Context, state serviceState, nodeID, datacenter, tagPrefix string, proxyDefaults proxyConfig) []desiredEndpoint {
+// translates its tags into published endpoints. It also lists the
+// certificates to publish: services that asked for one and whose selected
+// registration lives on this node — a certificate is published only by the
+// connector hosting the service.
+func desiredFromState(ctx context.Context, state serviceState, nodeID, datacenter, tagPrefix string, proxyDefaults proxyConfig) ([]desiredEndpoint, []desiredCert) {
 	groups := map[string][]serviceRegistration{}
 	for _, reg := range state {
 		groups[reg.Namespace+"\x00"+reg.ServiceName] = append(groups[reg.Namespace+"\x00"+reg.ServiceName], reg)
 	}
 
 	var desired []desiredEndpoint
+	var certs []desiredCert
 	claimed := map[string]string{}
 	groupKeys := make([]string, 0, len(groups))
 	for key := range groups {
@@ -660,10 +689,19 @@ func desiredFromState(ctx context.Context, state serviceState, nodeID, datacente
 			claimed[portKey] = qualified
 			desired = append(desired, want)
 		}
+		if spec.PublishCert && reg.NodeID == nodeID {
+			certs = append(certs, desiredCert{
+				Service:      spec.Service,
+				Namespace:    reg.Namespace,
+				NomadService: reg.ServiceName,
+				JobID:        reg.JobID,
+				AllocID:      reg.AllocID,
+			})
+		}
 	}
 
 	sort.Slice(desired, func(i, j int) bool { return desired[i].key() < desired[j].key() })
-	return desired
+	return desired, certs
 }
 
 func registrationScopeRank(reg serviceRegistration, scope, nodeID, datacenter string) (int, bool) {

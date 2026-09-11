@@ -247,3 +247,45 @@ func TestResolveHealthAddr(t *testing.T) {
 		t.Fatalf("off = %q, want disabled", got)
 	}
 }
+
+func TestHealthReportsCertificates(t *testing.T) {
+	ctx := context.Background()
+	h, now := testHealth(t, 3, 5)
+	h.reconcileSucceeded(ctx, reconcileStats{})
+
+	expiry := now.Add(60 * 24 * time.Hour)
+	h.certificatesReconciled(ctx, []certStatus{
+		{Service: "svc:ots", Namespace: "default", NomadService: "ots", Domain: "ots.example.ts.net", Path: "nomad/jobs/ots/server/app", State: certStatePublished, NotAfter: &expiry},
+		{Service: "svc:web", Namespace: "default", NomadService: "web", State: certStateFailed, LastError: "ACME says no"},
+	})
+
+	r := h.snapshot()
+	if r.Status != statusHealthy {
+		t.Fatalf("a failed certificate must not make the connector unhealthy; status = %q", r.Status)
+	}
+	if len(r.Certificates) != 2 {
+		t.Fatalf("certificates = %+v", r.Certificates)
+	}
+	if !containsReason(r.Reasons, "1 certificate could not be published") {
+		t.Fatalf("reasons = %v", r.Reasons)
+	}
+
+	body, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"path":"nomad/jobs/ots/server/app"`, `"not_after":"` + expiry.Format(time.RFC3339), `"last_error":"ACME says no"`, `"state":"published"`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("report missing %s:\n%s", want, body)
+		}
+	}
+}
+
+func containsReason(reasons []string, want string) bool {
+	for _, r := range reasons {
+		if strings.Contains(r, want) {
+			return true
+		}
+	}
+	return false
+}

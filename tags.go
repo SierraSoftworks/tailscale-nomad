@@ -12,9 +12,10 @@ import (
 // serviceSpec is the Tailscale publication a Nomad service asked for via its
 // tags.
 type serviceSpec struct {
-	Service   string // "svc:<name>"
-	Scope     string // node, datacenter, global
-	Endpoints []endpoint
+	Service     string // "svc:<name>"
+	Scope       string // node, datacenter, global
+	Endpoints   []endpoint
+	PublishCert bool // publish the Service's TLS certificate into a Nomad variable
 }
 
 // endpoint is one tailnet-facing port of a Tailscale Service.
@@ -70,6 +71,7 @@ func hasEnableTag(tags []string, prefix string) bool {
 //	tailscale.tls-terminated-tcp=<port> TLS-terminated TCP endpoint
 //	tailscale.path=<path>              mount path for http/https handlers
 //	tailscale.scope=<scope>            node, datacenter (default), or global
+//	tailscale.publish-cert=true|false  publish the Service's TLS certificate to a Nomad variable
 //	tailscale.max-connections=<count>   simultaneous connections per endpoint
 //	tailscale.read-header-timeout=<duration>
 //	tailscale.idle-timeout=<duration>
@@ -89,6 +91,7 @@ func parseTags(prefix, nomadService string, tags []string, defaults proxyConfig)
 	name := nomadService
 	scope := "datacenter"
 	path := ""
+	publishCert := false
 	proxy := defaults
 	ports := map[int]string{} // tailnet port -> proto
 
@@ -118,6 +121,15 @@ func parseTags(prefix, nomadService string, tags []string, defaults proxyConfig)
 				scope = value
 			default:
 				warns = append(warns, fmt.Sprintf("ignoring %s.scope=%q: must be node, datacenter, or global", prefix, value))
+			}
+		case key == "publish-cert":
+			switch value {
+			case "true":
+				publishCert = true
+			case "false":
+				publishCert = false
+			default:
+				warns = append(warns, fmt.Sprintf("ignoring %s.publish-cert=%q: must be true or false", prefix, value))
 			}
 		case key == "path":
 			if !strings.HasPrefix(value, "/") {
@@ -166,7 +178,7 @@ func parseTags(prefix, nomadService string, tags []string, defaults proxyConfig)
 		ports[443] = "https"
 	}
 
-	spec := &serviceSpec{Service: "svc:" + name, Scope: scope}
+	spec := &serviceSpec{Service: "svc:" + name, Scope: scope, PublishCert: publishCert}
 	for port, proto := range ports {
 		ep := endpoint{Proto: proto, Port: port, Proxy: proxy}
 		if proto == "http" || proto == "https" {

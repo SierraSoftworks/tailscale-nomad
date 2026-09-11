@@ -66,6 +66,15 @@ var (
 	mPublishFailures = must(meter.Int64Counter("connector.endpoints.publish_failures",
 		metric.WithDescription("Failed publish attempts (retried on a later pass)."),
 		metric.WithUnit("{failure}")))
+	mCertsPublished = must(meter.Int64Counter("connector.certificates.published",
+		metric.WithDescription("Service certificates written to a Nomad variable (new or renewed)."),
+		metric.WithUnit("{certificate}")))
+	mCertPublishFailures = must(meter.Int64Counter("connector.certificates.publish_failures",
+		metric.WithDescription("Failed certificate publication attempts (retried on a later pass)."),
+		metric.WithUnit("{failure}")))
+	mCertsTracked = must(meter.Int64Gauge("connector.certificates.tracked",
+		metric.WithDescription("Services whose certificate this connector publishes."),
+		metric.WithUnit("{certificate}")))
 	mStreamReconnects = must(meter.Int64Counter("connector.nomad.event_stream.reconnects",
 		metric.WithDescription("Nomad event-stream (re)connect attempts after a disconnect."),
 		metric.WithUnit("{reconnect}")))
