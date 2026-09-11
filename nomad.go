@@ -133,7 +133,7 @@ func (c *nomadClient) do(ctx context.Context, method, path string, query url.Val
 			}
 			if strings.HasPrefix(path, "/v1/var/") {
 				return nil, humane.Wrap(apiErr, "Nomad refused access to the variable",
-					`Publishing certificates needs a variables block in the connector's ACL policy: namespace "*" { variables { path "nomad/jobs/*/tls" { capabilities = ["read", "write"] } } } — see "Publishing certificates to backends" in the README.`,
+					`Publishing certificates needs a variables block in the connector's ACL policy: namespace "*" { variables { path "nomad/jobs/*" { capabilities = ["read", "write"] } } } — see "Publishing certificates to backends" in the README.`,
 				)
 			}
 			return nil, humane.Wrap(apiErr, "Nomad refused the request",

@@ -255,7 +255,7 @@ func TestHealthReportsCertificates(t *testing.T) {
 
 	expiry := now.Add(60 * 24 * time.Hour)
 	h.certificatesReconciled(ctx, []certStatus{
-		{Service: "svc:ots", Namespace: "default", NomadService: "ots", Domain: "ots.example.ts.net", Path: "nomad/jobs/ots/server/app/tls", State: certStatePublished, NotAfter: &expiry},
+		{Service: "svc:ots", Namespace: "default", NomadService: "ots", Domain: "ots.example.ts.net", Path: "nomad/jobs/ots/server/app", State: certStatePublished, NotAfter: &expiry},
 		{Service: "svc:web", Namespace: "default", NomadService: "web", State: certStateFailed, LastError: "ACME says no"},
 	})
 
@@ -274,7 +274,7 @@ func TestHealthReportsCertificates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"path":"nomad/jobs/ots/server/app/tls"`, `"not_after":"` + expiry.Format(time.RFC3339), `"last_error":"ACME says no"`, `"state":"published"`} {
+	for _, want := range []string{`"path":"nomad/jobs/ots/server/app"`, `"not_after":"` + expiry.Format(time.RFC3339), `"last_error":"ACME says no"`, `"state":"published"`} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("report missing %s:\n%s", want, body)
 		}

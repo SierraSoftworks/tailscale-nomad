@@ -142,8 +142,8 @@ func TestCertVariablePath(t *testing.T) {
 	tests := []struct {
 		job, group, task, want string
 	}{
-		{"ots", "server", "", "nomad/jobs/ots/server/tls"},
-		{"ots", "server", "app", "nomad/jobs/ots/server/app/tls"},
+		{"ots", "server", "", "nomad/jobs/ots/server"},
+		{"ots", "server", "app", "nomad/jobs/ots/server/app"},
 	}
 	for _, tt := range tests {
 		if got := certVariablePath(tt.job, tt.group, tt.task); got != tt.want {
@@ -291,7 +291,7 @@ func testCertPublisher(t *testing.T) *certFixture {
 	return f
 }
 
-const wantPath = "nomad/jobs/ots/server/app/tls"
+const wantPath = "nomad/jobs/ots/server/app"
 
 func TestCertPublishCreatesThenLeavesAlone(t *testing.T) {
 	f := testCertPublisher(t)
@@ -305,12 +305,12 @@ func TestCertPublishCreatesThenLeavesAlone(t *testing.T) {
 		t.Fatalf("written to %s:%s, want default:%s", written.Namespace, written.Path, wantPath)
 	}
 	wantItems := map[string]string{
-		"domain":    f.domain,
-		"cert":      string(f.certPEM),
-		"key":       string(f.keyPEM),
-		"not_after": f.now.Add(80 * 24 * time.Hour).Format(time.RFC3339),
+		"tailscale_domain":    f.domain,
+		"tailscale_cert":      string(f.certPEM),
+		"tailscale_key":       string(f.keyPEM),
+		"tailscale_not_after": f.now.Add(80 * 24 * time.Hour).Format(time.RFC3339),
 	}
-	if !itemsEqual(written.Items, wantItems) {
+	if len(written.Items) != len(wantItems) || !itemsContain(written.Items, wantItems) {
 		t.Fatalf("items = %v, want %v", keysOf(written.Items), keysOf(wantItems))
 	}
 	if len(statuses) != 1 || statuses[0].State != certStatePublished || statuses[0].Path != wantPath || statuses[0].Domain != f.domain {
@@ -334,7 +334,7 @@ func TestCertPublishReplacesStaleWithCheckAndSet(t *testing.T) {
 	f := testCertPublisher(t)
 	oldCert, oldKey := testCertPair(t, f.domain, f.now.Add(10*24*time.Hour)) // inside the renewal window
 	stored := f.nomad.seed("default", wantPath, map[string]string{
-		"domain": f.domain, "cert": string(oldCert), "key": string(oldKey), "not_after": "whenever",
+		"tailscale_domain": f.domain, "tailscale_cert": string(oldCert), "tailscale_key": string(oldKey), "tailscale_not_after": "whenever",
 	})
 
 	f.pub.publish(context.Background(), []desiredCert{f.want})
@@ -351,15 +351,15 @@ func TestCertPublishReplacesUnusableStoredVariable(t *testing.T) {
 		name  string
 		items func(f *certFixture) map[string]string
 	}{
-		{"garbage", func(f *certFixture) map[string]string { return map[string]string{"cert": "nope"} }},
+		{"garbage", func(f *certFixture) map[string]string { return map[string]string{"tailscale_cert": "nope"} }},
 		{"wrong domain", func(f *certFixture) map[string]string {
 			otherCert, otherKey := testCertPair(t, "other.example.ts.net", f.now.Add(80*24*time.Hour))
-			return map[string]string{"domain": "other.example.ts.net", "cert": string(otherCert), "key": string(otherKey)}
+			return map[string]string{"tailscale_domain": "other.example.ts.net", "tailscale_cert": string(otherCert), "tailscale_key": string(otherKey)}
 		}},
 		{"key does not match", func(f *certFixture) map[string]string {
 			freshCert, _ := testCertPair(t, f.domain, f.now.Add(80*24*time.Hour))
 			_, otherKey := testCertPair(t, f.domain, f.now.Add(80*24*time.Hour))
-			return map[string]string{"domain": f.domain, "cert": string(freshCert), "key": string(otherKey)}
+			return map[string]string{"tailscale_domain": f.domain, "tailscale_cert": string(freshCert), "tailscale_key": string(otherKey)}
 		}},
 	}
 	for _, tt := range tests {
@@ -382,7 +382,7 @@ func TestCertPublishKeepsAnotherHostsCurrentCertificate(t *testing.T) {
 	f := testCertPublisher(t)
 	theirCert, theirKey := testCertPair(t, f.domain, f.now.Add(60*24*time.Hour))
 	f.nomad.seed("default", wantPath, map[string]string{
-		"domain": f.domain, "cert": string(theirCert), "key": string(theirKey), "not_after": "x",
+		"tailscale_domain": f.domain, "tailscale_cert": string(theirCert), "tailscale_key": string(theirKey), "tailscale_not_after": "x",
 	})
 
 	statuses := f.pub.publish(context.Background(), []desiredCert{f.want})
@@ -404,10 +404,44 @@ func TestCertPublishKeepsAnotherHostsCurrentCertificate(t *testing.T) {
 	}
 }
 
+// The variable is the workload's own — the job may keep its secrets there —
+// so publishing must add the tailscale_* items beside whatever is stored and
+// never drop or rewrite the operator's items.
+func TestCertPublishMergesIntoWorkloadVariable(t *testing.T) {
+	f := testCertPublisher(t)
+	oldCert, oldKey := testCertPair(t, f.domain, f.now.Add(5*24*time.Hour))
+	stored := f.nomad.seed("default", wantPath, map[string]string{
+		"db_password":    "hunter2",
+		"tailscale_cert": string(oldCert),
+		"tailscale_key":  string(oldKey),
+	})
+
+	statuses := f.pub.publish(context.Background(), []desiredCert{f.want})
+	if statuses[0].State != certStatePublished || len(f.nomad.writes) != 1 || f.nomad.cas[0] != stored.ModifyIndex {
+		t.Fatalf("status=%+v writes=%d cas=%v", statuses[0], len(f.nomad.writes), f.nomad.cas)
+	}
+	got := f.nomad.writes[0].Items
+	if got["db_password"] != "hunter2" {
+		t.Fatalf("operator item lost or changed: %q", got["db_password"])
+	}
+	if got["tailscale_cert"] != string(f.certPEM) || got["tailscale_key"] != string(f.keyPEM) || got["tailscale_domain"] != f.domain {
+		t.Fatalf("tailscale items not replaced: %v", keysOf(got))
+	}
+
+	// A variable holding only the operator's items gains the certificate
+	// without disturbing them.
+	f2 := testCertPublisher(t)
+	f2.nomad.seed("default", wantPath, map[string]string{"db_password": "hunter2"})
+	f2.pub.publish(context.Background(), []desiredCert{f2.want})
+	if len(f2.nomad.writes) != 1 || f2.nomad.writes[0].Items["db_password"] != "hunter2" || f2.nomad.writes[0].Items["tailscale_cert"] == "" {
+		t.Fatalf("writes = %+v", keysOf(f2.nomad.writes[0].Items))
+	}
+}
+
 func TestCertPublishConflictIsRetriedNextPass(t *testing.T) {
 	f := testCertPublisher(t)
 	oldCert, oldKey := testCertPair(t, f.domain, f.now.Add(5*24*time.Hour))
-	f.nomad.seed("default", wantPath, map[string]string{"domain": f.domain, "cert": string(oldCert), "key": string(oldKey)})
+	f.nomad.seed("default", wantPath, map[string]string{"tailscale_domain": f.domain, "tailscale_cert": string(oldCert), "tailscale_key": string(oldKey)})
 
 	// A concurrent writer bumps the index between our read and write.
 	realPut := f.nomad.putVariable
@@ -439,7 +473,7 @@ type racingNomad struct {
 
 func (r *racingNomad) putVariable(ctx context.Context, v nomadVariable, cas uint64) (*nomadVariable, error) {
 	racer := v
-	racer.Items = map[string]string{"cert": "stale", "domain": v.Items["domain"]}
+	racer.Items = map[string]string{"tailscale_cert": "stale", "tailscale_domain": v.Items["tailscale_domain"]}
 	if _, err := r.put(ctx, racer, cas); err != nil {
 		return nil, err
 	}
@@ -459,7 +493,7 @@ func TestCertPublishFailuresAreIsolated(t *testing.T) {
 	for _, st := range statuses {
 		byName[st.NomadService] = st
 	}
-	if st := byName["broken"]; st.State != certStateFailed || !strings.Contains(st.LastError, "ACME says no") || st.Path != "nomad/jobs/ots/web/tls" {
+	if st := byName["broken"]; st.State != certStateFailed || !strings.Contains(st.LastError, "ACME says no") || st.Path != "nomad/jobs/ots/web" {
 		t.Fatalf("broken status = %+v", st)
 	}
 	if st := byName["nope"]; st.State != certStateFailed || !strings.Contains(st.LastError, "attribute") || st.Path != "" {
@@ -517,7 +551,7 @@ func TestDesiredFromStateListsCertificatesForLocalHostsOnly(t *testing.T) {
 func keysOf(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k, v := range m {
-		if k == "cert" || k == "key" {
+		if k == "tailscale_cert" || k == "tailscale_key" {
 			v = fmt.Sprintf("<%d bytes>", len(v))
 		}
 		out = append(out, k+"="+v)

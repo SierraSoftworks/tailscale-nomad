@@ -25,22 +25,21 @@ import (
 // itself (mutual TLS, a protocol tsnet cannot terminate) can still present the
 // publicly trusted certificate for <service>.<tailnet>.ts.net.
 //
-// The variable lives next to the service that asked for it — beneath the
-// job/group(/task) path Nomad reserves for the workload — under a fixed /tls
-// suffix, and carries the items domain, cert, key, and not_after. Only the
-// connector on the node hosting the service publishes; other nodes leave a
-// certificate alone while it is still good, so several hosts of one Service
-// do not take turns overwriting each other.
+// The items are merged into the workload's own variable — the
+// nomad/jobs/<job>/<group>(/<task>) path a task's default workload identity
+// can already read — under tailscale_* keys, so the consuming job needs no
+// extra ACL policy and anything else the operator keeps in that variable is
+// left untouched. Only the connector on the node hosting the service
+// publishes; other nodes leave a certificate alone while it is still good, so
+// several hosts of one Service do not take turns overwriting each other.
 
-// certVariableSuffix is the last path segment of every published variable.
-const certVariableSuffix = "tls"
-
-// Items of the published variable.
+// Items the connector owns in the workload's variable. Everything else in the
+// variable belongs to the operator and is carried over unchanged.
 const (
-	certItemDomain   = "domain"
-	certItemCert     = "cert"
-	certItemKey      = "key"
-	certItemNotAfter = "not_after"
+	certItemDomain   = "tailscale_domain"
+	certItemCert     = "tailscale_cert"
+	certItemKey      = "tailscale_key"
+	certItemNotAfter = "tailscale_not_after"
 )
 
 // certSource obtains certificates from the tailnet. Implemented by
@@ -131,14 +130,15 @@ func (d desiredCert) String() string {
 	return fmt.Sprintf("%s certificate for %s/%s", d.Service, d.Namespace, d.NomadService)
 }
 
-// certVariablePath derives the variable path for a service. Task-level
-// services publish beneath the task, group-level services beneath the group;
-// both end in /tls.
+// certVariablePath derives the variable path for a service: the workload's
+// own variable, which Nomad grants the task's identity read access to. A
+// task-level service publishes into the task's variable, a group-level
+// service into the group's.
 func certVariablePath(jobID, group, task string) string {
 	if task != "" {
-		return fmt.Sprintf("nomad/jobs/%s/%s/%s/%s", jobID, group, task, certVariableSuffix)
+		return fmt.Sprintf("nomad/jobs/%s/%s/%s", jobID, group, task)
 	}
-	return fmt.Sprintf("nomad/jobs/%s/%s/%s", jobID, group, certVariableSuffix)
+	return fmt.Sprintf("nomad/jobs/%s/%s", jobID, group)
 }
 
 // attributeService finds where in the allocation's job the registered service
@@ -367,9 +367,10 @@ func (p *certPublisher) snapshot() []certStatus {
 }
 
 // publishOne resolves the variable path and domain for one certificate and
-// writes the variable when the stored one is missing, stale, or unusable. It
-// fills st with what it learns along the way so a failure still reports the
-// path and domain it was working on.
+// merges the tailscale_* items into the variable when the stored certificate
+// is missing, stale, or unusable; the operator's own items in that variable
+// are carried over as they are. It fills st with what it learns along the way
+// so a failure still reports the path and domain it was working on.
 func (p *certPublisher) publishOne(ctx context.Context, d desiredCert, st *certStatus) (string, error) {
 	ctx, span := tracer.Start(ctx, "publish certificate", trace.WithAttributes(
 		attribute.String("tailscale.service", d.Service),
@@ -428,8 +429,9 @@ func (p *certPublisher) publishOne(ctx context.Context, d desiredCert, st *certS
 		return fail(fmt.Errorf("reading variable %s: %w", path, err))
 	}
 	var cas uint64
+	merged := map[string]string{}
 	if stored != nil {
-		if itemsEqual(stored.Items, items) {
+		if itemsContain(stored.Items, items) {
 			t := notAfter
 			st.NotAfter = &t
 			return certStateCurrent, nil
@@ -441,10 +443,18 @@ func (p *certPublisher) publishOne(ctx context.Context, d desiredCert, st *certS
 			span.AddEvent("kept the stored certificate")
 			return certStateCurrent, nil
 		}
+		// The variable is the workload's own: keep whatever else lives in
+		// it and only replace the items the connector owns.
+		for k, v := range stored.Items {
+			merged[k] = v
+		}
 		cas = stored.ModifyIndex
 	}
+	for k, v := range items {
+		merged[k] = v
+	}
 
-	if _, err := p.nomad.putVariable(ctx, nomadVariable{Namespace: d.Namespace, Path: path, Items: items}, cas); err != nil {
+	if _, err := p.nomad.putVariable(ctx, nomadVariable{Namespace: d.Namespace, Path: path, Items: merged}, cas); err != nil {
 		if errors.Is(err, errVariableConflict) {
 			return fail(fmt.Errorf("writing variable %s: %w; retrying on the next pass", path, err))
 		}
@@ -455,10 +465,10 @@ func (p *certPublisher) publishOne(ctx context.Context, d desiredCert, st *certS
 	return certStatePublished, nil
 }
 
-// storedUsable reports whether a stored variable holds a certificate for
-// domain that a backend could still serve for at least minValidity: the chain
-// parses, the key matches it, it covers the domain, and it is not yet due for
-// renewal. Anything else is replaced.
+// storedUsable reports whether a stored variable's tailscale_* items hold a
+// certificate for domain that a backend could still serve for at least
+// minValidity: the chain parses, the key matches it, it covers the domain,
+// and it is not yet due for renewal. Anything else is replaced.
 func (p *certPublisher) storedUsable(stored *nomadVariable, domain string) (time.Time, bool) {
 	if stored.Items[certItemDomain] != domain {
 		return time.Time{}, false
@@ -477,12 +487,11 @@ func (p *certPublisher) storedUsable(stored *nomadVariable, domain string) (time
 	return leaf.NotAfter, true
 }
 
-func itemsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if bv, ok := b[k]; !ok || bv != v {
+// itemsContain reports whether stored already carries every item in want
+// with the same value; other items in stored are the operator's and ignored.
+func itemsContain(stored, want map[string]string) bool {
+	for k, v := range want {
+		if sv, ok := stored[k]; !ok || sv != v {
 			return false
 		}
 	}
