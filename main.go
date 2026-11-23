@@ -243,7 +243,7 @@ func run() int {
 			if err == nil {
 				repairAgain := false
 				for _, batch := range replay {
-					if !repaired.apply(batch, *tagPrefix) {
+					if !repaired.apply(batch) {
 						repairAgain = true
 					}
 				}
@@ -253,7 +253,7 @@ func run() int {
 				for {
 					select {
 					case batch := <-events:
-						if batch.Repair || !repaired.apply(batch, *tagPrefix) {
+						if batch.Repair || !repaired.apply(batch) {
 							repairAgain = true
 						}
 					default:
@@ -407,7 +407,7 @@ func run() int {
 			var replay []serviceEventBatch
 			if !repair {
 				replay = append(replay, batch)
-				repair = !state.apply(batch, *tagPrefix)
+				repair = !state.apply(batch)
 			}
 			// Debounce bursts (e.g. a deployment replacing several allocs).
 			timer := time.NewTimer(500 * time.Millisecond)
@@ -421,7 +421,7 @@ func run() int {
 						repair = true
 					} else {
 						replay = append(replay, next)
-						if !state.apply(next, *tagPrefix) {
+						if !state.apply(next) {
 							repair = true
 						}
 					}
@@ -527,7 +527,10 @@ type serviceState map[string]serviceRegistration
 
 func registrationKey(namespace, id string) string { return namespace + "\x00" + id }
 
-func (s serviceState) apply(batch serviceEventBatch, tagPrefix string) bool {
+// apply folds an event batch into the snapshot. Registrations that have not
+// opted in are kept too: desiredFromState needs them to tell a node that
+// hosts a service without publishing it from one that doesn't host it.
+func (s serviceState) apply(batch serviceEventBatch) bool {
 	for _, event := range batch.Events {
 		reg := event.Payload.Service
 		namespace := event.Namespace
@@ -549,10 +552,6 @@ func (s serviceState) apply(batch serviceEventBatch, tagPrefix string) bool {
 			}
 			reg.ID = id
 			reg.Namespace = namespace
-			if !hasEnableTag(reg.Tags, tagPrefix) {
-				delete(s, key)
-				continue
-			}
 			if current, ok := s[key]; !ok || reg.ModifyIndex >= current.ModifyIndex {
 				s[key] = reg
 			}
@@ -607,10 +606,14 @@ func gatherState(ctx context.Context, nomad *nomadClient, tagPrefix string) (sta
 }
 
 // desiredFromState selects one reachable registration for each service and
-// translates its tags into published endpoints. It also lists the
-// certificates to publish: services that asked for one and whose selected
-// registration lives on this node — a certificate is published only by the
-// connector hosting the service.
+// translates its tags into published endpoints. Tags are read from each
+// registration individually, so a service whose registrations are tagged
+// differently per node is published per node: a node hosting the service
+// follows its own registrations' tags (and stays out when none of them opt
+// in), while a node without one may proxy to an opted-in registration that
+// its scope reaches. It also lists the certificates to publish: services that
+// asked for one and whose selected registration lives on this node — a
+// certificate is published only by the connector hosting the service.
 func desiredFromState(ctx context.Context, state serviceState, nodeID, datacenter, tagPrefix string, proxyDefaults proxyConfig) ([]desiredEndpoint, []desiredCert) {
 	groups := map[string][]serviceRegistration{}
 	for _, reg := range state {
@@ -627,34 +630,35 @@ func desiredFromState(ctx context.Context, state serviceState, nodeID, datacente
 	sort.Strings(groupKeys)
 	for _, groupKey := range groupKeys {
 		regs := groups[groupKey]
-		sort.Slice(regs, func(i, j int) bool {
-			if regs[i].CreateIndex != regs[j].CreateIndex {
-				return regs[i].CreateIndex > regs[j].CreateIndex
-			}
-			return regs[i].ID < regs[j].ID
-		})
-		spec, warns := parseTags(tagPrefix, regs[0].ServiceName, regs[0].Tags, proxyDefaults)
-		for _, w := range warns {
-			logf(ctx, levelWarn, "service %s/%s: %s", regs[0].Namespace, regs[0].ServiceName, w)
-		}
-		if spec == nil {
-			continue
-		}
 
 		var reg serviceRegistration
+		var spec *serviceSpec
+		var warns []string
 		bestRank := 3
+		hostsLocally := false
 		for _, candidate := range regs {
-			rank, ok := registrationScopeRank(candidate, spec.Scope, nodeID, datacenter)
+			local := candidate.NodeID == nodeID
+			hostsLocally = hostsLocally || local
+			candidateSpec, candidateWarns := parseTags(tagPrefix, candidate.ServiceName, candidate.Tags, proxyDefaults)
+			if candidateSpec == nil {
+				continue
+			}
+			rank, ok := registrationScopeRank(candidate, candidateSpec.Scope, nodeID, datacenter)
 			if !ok || rank > bestRank {
 				continue
 			}
 			if reg.ID == "" || rank < bestRank || candidate.CreateIndex > reg.CreateIndex ||
 				(candidate.CreateIndex == reg.CreateIndex && candidate.ID < reg.ID) {
-				reg, bestRank = candidate, rank
+				reg, spec, warns, bestRank = candidate, candidateSpec, candidateWarns, rank
 			}
 		}
-		if reg.ID == "" {
+		// A node that hosts the service decides from its own registrations:
+		// if none of them opted in, another node's tags don't publish it here.
+		if reg.ID == "" || (hostsLocally && reg.NodeID != nodeID) {
 			continue
+		}
+		for _, w := range warns {
+			logf(ctx, levelWarn, "service %s/%s: %s", reg.Namespace, reg.ServiceName, w)
 		}
 		if reg.Address == "" || reg.Port == 0 {
 			logf(ctx, levelWarn, "%s", display(humane.New(

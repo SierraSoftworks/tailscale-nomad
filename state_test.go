@@ -77,42 +77,111 @@ func TestServiceStateAppliesEventsIncrementally(t *testing.T) {
 			ID: "reg-1", ServiceName: "web", Namespace: "default", Tags: []string{"tailscale.enable=true"}, ModifyIndex: 10,
 		}},
 	}}}
-	if !state.apply(upsert, "tailscale") || len(state) != 1 {
+	if !state.apply(upsert) || len(state) != 1 {
 		t.Fatalf("upsert did not populate state: %+v", state)
 	}
 
 	stale := upsert
 	stale.Events[0].Payload.Service.ModifyIndex = 9
 	stale.Events[0].Payload.Service.Address = "stale"
-	if !state.apply(stale, "tailscale") || state[registrationKey("default", "reg-1")].Address == "stale" {
+	if !state.apply(stale) || state[registrationKey("default", "reg-1")].Address == "stale" {
 		t.Fatal("stale upsert replaced current registration")
 	}
 
 	deleteBatch := serviceEventBatch{Index: 11, Events: []serviceEvent{{
 		Type: "ServiceDeregistration", Key: "reg-1", Namespace: "default", Index: 11,
 	}}}
-	if !state.apply(deleteBatch, "tailscale") || len(state) != 0 {
+	if !state.apply(deleteBatch) || len(state) != 0 {
 		t.Fatalf("delete did not remove registration: %+v", state)
 	}
 }
 
 func TestServiceStateRejectsUnknownEvents(t *testing.T) {
 	state := serviceState{}
-	if state.apply(serviceEventBatch{Events: []serviceEvent{{Type: "Unexpected", Key: "x", Namespace: "default"}}}, "tailscale") {
+	if state.apply(serviceEventBatch{Events: []serviceEvent{{Type: "Unexpected", Key: "x", Namespace: "default"}}}) {
 		t.Fatal("unknown event should request a full repair")
 	}
 }
 
-func TestServiceStateDropsDisabledRegistration(t *testing.T) {
+func TestServiceStateDisabledRegistrationIsNotPublished(t *testing.T) {
 	key := registrationKey("default", "reg-1")
-	state := serviceState{key: {ID: "reg-1", ServiceName: "web", Namespace: "default", Tags: []string{"tailscale.enable=true"}}}
+	state := serviceState{key: {ID: "reg-1", ServiceName: "web", Namespace: "default", NodeID: "node-1", Datacenter: "dc-1", Tags: []string{"tailscale.enable=true"}, Address: "10.0.0.1", Port: 8001}}
 	batch := serviceEventBatch{Events: []serviceEvent{{
 		Type: "ServiceRegistration", Key: "reg-1", Namespace: "default",
 		Payload: struct{ Service serviceRegistration }{Service: serviceRegistration{
-			ID: "reg-1", ServiceName: "web", Namespace: "default", Tags: nil, ModifyIndex: 2,
+			ID: "reg-1", ServiceName: "web", Namespace: "default", NodeID: "node-1", Datacenter: "dc-1", Address: "10.0.0.1", Port: 8001, ModifyIndex: 2,
 		}},
 	}}}
-	if !state.apply(batch, "tailscale") || len(state) != 0 {
-		t.Fatalf("disabled registration remains cached: %+v", state)
+	if !state.apply(batch) {
+		t.Fatal("registration update should apply incrementally")
+	}
+	if desired, _ := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256)); len(desired) != 0 {
+		t.Fatalf("desired = %+v, want nothing published once the tags are removed", desired)
+	}
+}
+
+// Registrations of one service can be tagged differently per node; each node
+// must follow its own registration rather than whichever registered last.
+func TestDesiredFromStateReadsTagsPerRegistration(t *testing.T) {
+	enabled := []string{"tailscale.enable=true", "tailscale.tcp=4317"}
+	reg := func(id, node, dc string, tags []string, index uint64) serviceRegistration {
+		return serviceRegistration{ID: id, ServiceName: "otel", Namespace: "default", NodeID: node, Datacenter: dc, Tags: tags, Address: "10.0.0." + id, Port: 4317, CreateIndex: index}
+	}
+	tests := []struct {
+		name        string
+		regs        []serviceRegistration
+		wantBackend string // "" = not published
+		wantPort    int
+	}{
+		{
+			name:        "local tagged, newer remote untagged",
+			regs:        []serviceRegistration{reg("1", "node-1", "dc-1", enabled, 1), reg("2", "node-2", "dc-1", nil, 2)},
+			wantBackend: "10.0.0.1:4317", wantPort: 4317,
+		},
+		{
+			name: "local untagged, newer remote tagged",
+			regs: []serviceRegistration{reg("1", "node-1", "dc-1", nil, 1), reg("2", "node-2", "dc-1", enabled, 2)},
+		},
+		{
+			name: "local untagged, older remote tagged",
+			regs: []serviceRegistration{reg("1", "node-1", "dc-1", nil, 2), reg("2", "node-2", "dc-1", enabled, 1)},
+		},
+		{
+			name:        "not hosted locally, newer remote untagged",
+			regs:        []serviceRegistration{reg("2", "node-2", "dc-1", enabled, 1), reg("3", "node-3", "dc-1", nil, 2)},
+			wantBackend: "10.0.0.2:4317", wantPort: 4317,
+		},
+		{
+			name:        "local tags win over newer remote tags",
+			regs:        []serviceRegistration{reg("1", "node-1", "dc-1", enabled, 1), reg("2", "node-2", "dc-1", []string{"tailscale.enable=true", "tailscale.tcp=9999"}, 2)},
+			wantBackend: "10.0.0.1:4317", wantPort: 4317,
+		},
+		{
+			name: "scope is read from the candidate registration",
+			regs: []serviceRegistration{reg("2", "node-2", "dc-1", append([]string{"tailscale.scope=node"}, enabled...), 1), reg("3", "node-3", "dc-2", enabled, 2)},
+		},
+		{
+			name:        "local tagged replacement beside local untagged",
+			regs:        []serviceRegistration{reg("1", "node-1", "dc-1", nil, 1), reg("4", "node-1", "dc-1", enabled, 2)},
+			wantBackend: "10.0.0.4:4317", wantPort: 4317,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := serviceState{}
+			for _, r := range tt.regs {
+				state[registrationKey(r.Namespace, r.ID)] = r
+			}
+			desired, _ := desiredFromState(context.Background(), state, "node-1", "dc-1", "tailscale", defaultProxyConfig(256))
+			if tt.wantBackend == "" {
+				if len(desired) != 0 {
+					t.Fatalf("desired = %+v, want nothing published", desired)
+				}
+				return
+			}
+			if len(desired) != 1 || desired[0].Backend != tt.wantBackend || desired[0].Port != tt.wantPort {
+				t.Fatalf("desired = %+v, want %s on port %d", desired, tt.wantBackend, tt.wantPort)
+			}
+		})
 	}
 }

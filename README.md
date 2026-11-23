@@ -276,6 +276,14 @@ traffic. For every scope, a connector prefers a backend on its own node, then
 one in its datacenter, then (for `global`) one in another datacenter; the newest
 registration breaks ties within the same locality.
 
+Tags are read from each registration individually, so registrations of one
+Nomad service can be tagged differently per node (for example, a system job
+that opts in on only some node pools). A connector whose node hosts the service
+follows its own registrations: it advertises only if one of them carries
+`tailscale.enable=true`, and uses that registration's tags. A connector whose
+node does not host the service uses the tags of the opted-in registration it
+selects as its backend.
+
 ### Routing performance
 
 There are two independent routing decisions:
